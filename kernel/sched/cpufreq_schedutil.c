@@ -177,18 +177,15 @@ static bool is_gpu_heavy_load(void)
 {
     struct file *file;
     char buf[16];
-    mm_segment_t old_fs;
     ssize_t len;
     int gpu_usage;
+    loff_t pos = 0;
 
     file = filp_open("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", O_RDONLY, 0);
     if (IS_ERR(file))
         return false;
 
-    old_fs = get_fs();
-    set_fs(KERNEL_DS);
-    len = kernel_read(file, buf, sizeof(buf) - 1, &file->f_pos);
-    set_fs(old_fs);
+    len = kernel_read(file, buf, sizeof(buf) - 1, &pos);
     filp_close(file, NULL);
 
     if (len <= 0)
