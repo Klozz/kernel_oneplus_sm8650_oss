@@ -136,6 +136,11 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy)
 	}
 }
 
+#ifdef CONFIG_SCHED_BORE
+extern u8 sched_burst_penalty_offset;
+extern u32 sched_burst_penalty_scale;
+#endif
+
 /**
  * get_next_freq - Compute a new frequency for a given cpufreq policy.
  * @sg_policy: schedutil policy object to compute the new frequency for.
@@ -181,6 +186,12 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		freq = next_freq;
 	else
 		freq = map_util_freq(util, freq, max);
+
+#ifdef CONFIG_SCHED_BORE
+    struct task_struct *p = current;
+    u8 burst_penalty = p->se.burst_penalty;
+    freq += (burst_penalty * sched_burst_penalty_scale) >> 6;
+#endif
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
@@ -376,6 +387,10 @@ static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
 	boost = sugov_iowait_apply(sg_cpu, time, max_cap);
 	sugov_get_util(sg_cpu, boost);
 
+#ifdef CONFIG_SCHED_BORE
+    sg_cpu->util += (current->se.burst_penalty * sched_burst_penalty_scale) >> 6;
+#endif
+
 	return true;
 }
 
@@ -431,6 +446,10 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
 
 	if (!sugov_update_single_common(sg_cpu, time, max_cap, flags))
 		return;
+
+#ifdef CONFIG_SCHED_BORE
+    sg_cpu->util += (current->se.burst_penalty * sched_burst_penalty_scale) >> 6;
+#endif
 
 	cpufreq_driver_adjust_perf(sg_cpu->cpu, sg_cpu->bw_min,
 				   sg_cpu->util, max_cap);
