@@ -6,9 +6,25 @@
  * Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
  */
 
+#include <linux/cgroup.h>
+#include <linux/jiffies.h>
+#include <linux/hash.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
 #include <trace/hooks/sched.h>
 
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
+
+#define BOOST_THRESHOLD (15 * HZ) // 15 seconds in jiffies before applying boost
+#define GPU_USAGE_THRESHOLD 30 // Minimum 30% GPU usage to trigger boost
+
+static DEFINE_HASHTABLE(top_app_times, 8);
+
+struct top_app_entry {
+    struct hlist_node node;
+    pid_t pid;
+    unsigned long start_time;
+};
 
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
@@ -141,6 +157,75 @@ extern u8 sched_burst_penalty_offset;
 extern u32 sched_burst_penalty_scale;
 #endif
 
+/* Check if the given task belongs to the 'top-app' cgroup */
+static bool is_top_app_task(struct task_struct *task)
+{
+    struct cgroup_subsys_state *css;
+
+    rcu_read_lock();
+    css = task_css(task, cpu_cgrp_id);
+    rcu_read_unlock();
+
+    if (!css)
+        return false;
+
+    return strstr(css->cgroup->kn->name, "top-app");
+}
+
+/* Read GPU utilization and determine if it is under heavy load */
+static bool is_gpu_heavy_load(void)
+{
+    struct file *file;
+    char buf[16];
+    mm_segment_t old_fs;
+    ssize_t len;
+    int gpu_usage;
+
+    file = filp_open("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", O_RDONLY, 0);
+    if (IS_ERR(file))
+        return false;
+
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+    len = kernel_read(file, buf, sizeof(buf) - 1, &file->f_pos);
+    set_fs(old_fs);
+    filp_close(file, NULL);
+
+    if (len <= 0)
+        return false;
+
+    buf[len] = '\0';
+    if (kstrtoint(buf, 10, &gpu_usage))
+        return false;
+
+    return gpu_usage >= GPU_USAGE_THRESHOLD;
+}
+
+/* Determine if a task should receive a frequency boost */
+static bool should_boost_task(struct task_struct *task)
+{
+    struct top_app_entry *entry;
+    unsigned long now = jiffies;
+    pid_t pid = task->pid;
+
+    hash_for_each_possible(top_app_times, entry, node, pid) {
+        if (entry->pid == pid) {
+            if (time_after(now, entry->start_time + BOOST_THRESHOLD) && is_gpu_heavy_load())
+                return true;
+            return false;
+        }
+    }
+
+    entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+    if (!entry)
+        return false;
+
+    entry->pid = pid;
+    entry->start_time = now;
+    hash_add(top_app_times, &entry->node, pid);
+    return false;
+}
+
 /**
  * get_next_freq - Compute a new frequency for a given cpufreq policy.
  * @sg_policy: schedutil policy object to compute the new frequency for.
@@ -188,9 +273,12 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		freq = map_util_freq(util, freq, max);
 
 #ifdef CONFIG_SCHED_BORE
-    struct task_struct *p = current;
-    u8 burst_penalty = p->se.burst_penalty;
-    freq += (burst_penalty * sched_burst_penalty_scale) >> 6;
+    /* Apply burst penalty adjustment if task is a game (top-app + GPU heavy) */
+    if (is_top_app_task(current) && should_boost_task(current)) {
+        struct task_struct *p = current;
+        u8 burst_penalty = p->se.burst_penalty;
+        freq += (burst_penalty * sched_burst_penalty_scale) >> 6;
+    }
 #endif
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
