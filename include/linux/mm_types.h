@@ -440,6 +440,12 @@ struct vma_lock {
 	struct rw_semaphore lock;
 };
 
+struct vma_numab_state {
+	unsigned long next_scan;
+	unsigned long next_pid_reset;
+	unsigned long access_pids[2];
+};
+
 /*
  * This struct describes a virtual memory area. There is one of these
  * per VM-area/task. A VM area is any part of the process virtual memory
@@ -546,6 +552,9 @@ struct vm_area_struct {
 #endif
 #ifdef CONFIG_NUMA
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
+#endif
+#ifdef CONFIG_NUMA_BALANCING
+	struct vma_numab_state *numab_state;	/* NUMA Balancing state */
 #endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
 

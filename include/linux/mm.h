@@ -31,6 +31,7 @@
 #include <linux/kasan.h>
 #include <linux/page_pinner.h>
 #include <linux/memremap.h>
+#include <linux/slab.h>
 #include <linux/android_kabi.h>
 
 struct mempolicy;
@@ -634,6 +635,20 @@ struct vm_operations_struct {
 	ANDROID_KABI_RESERVE(4);
 };
 
+#ifdef CONFIG_NUMA_BALANCING
+static inline void vma_numab_state_init(struct vm_area_struct *vma)
+{
+	vma->numab_state = NULL;
+}
+static inline void vma_numab_state_free(struct vm_area_struct *vma)
+{
+	kfree(vma->numab_state);
+}
+#else
+static inline void vma_numab_state_init(struct vm_area_struct *vma) {}
+static inline void vma_numab_state_free(struct vm_area_struct *vma) {}
+#endif /* CONFIG_NUMA_BALANCING */
+
 #ifdef CONFIG_PER_VMA_LOCK
 /*
  * Try to read-lock a vma. The function is allowed to occasionally yield false
@@ -821,6 +836,7 @@ static inline void vma_init(struct vm_area_struct *vma, struct mm_struct *mm)
 	vma->vm_ops = &dummy_vm_ops;
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	vma_mark_detached(vma, false);
+	vma_numab_state_init(vma);
 }
 
 /* Use when VMA is not part of the VMA tree and needs no locking */
@@ -1644,6 +1660,16 @@ static inline int xchg_page_access_time(struct page *page, int time)
 	last_time = page_cpupid_xchg_last(page, time >> PAGE_ACCESS_TIME_BUCKETS);
 	return last_time << PAGE_ACCESS_TIME_BUCKETS;
 }
+
+static inline void vma_set_access_pid_bit(struct vm_area_struct *vma)
+{
+	unsigned int pid_bit;
+
+	pid_bit = hash_32(current->pid, ilog2(BITS_PER_LONG));
+	if (vma->numab_state && !test_bit(pid_bit, &vma->numab_state->access_pids[1])) {
+		__set_bit(pid_bit, &vma->numab_state->access_pids[1]);
+	}
+}
 #else /* !CONFIG_NUMA_BALANCING */
 static inline int page_cpupid_xchg_last(struct page *page, int cpupid)
 {
@@ -1692,6 +1718,10 @@ static inline void page_cpupid_reset_last(struct page *page)
 static inline bool cpupid_match_pid(struct task_struct *task, int cpupid)
 {
 	return false;
+}
+
+static inline void vma_set_access_pid_bit(struct vm_area_struct *vma)
+{
 }
 #endif /* CONFIG_NUMA_BALANCING */
 

@@ -5,6 +5,10 @@
 #include <linux/cpufreq_times.h>
 #include <trace/hooks/sched.h>
 
+#ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ #include <asm/cputime.h>
+#endif
+
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 
 /*
