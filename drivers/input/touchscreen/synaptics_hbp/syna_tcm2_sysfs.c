@@ -892,6 +892,44 @@ exit:
 static struct kobj_attribute kobj_attr_gesture_coordinate =
 	__ATTR(gesture_coordinate, 0444, syna_sysfs_gesture_coordinate_show, NULL);
 
+static ssize_t syna_sysfs_fp_pressed_show(struct device *device,
+		struct device_attribute *attribute, char *buf)
+{
+	uint8_t ret = 0;
+	struct syna_tcm *tcm = dev_get_drvdata(device);
+
+	ret = scnprintf(buf, PAGE_SIZE, "%i\n", tcm->fp_pressed);
+	tcm->fp_pressed = 0;
+	return ret;
+}
+
+static DEVICE_ATTR(fp_pressed, S_IRUGO, syna_sysfs_fp_pressed_show, NULL);
+
+static ssize_t syna_sysfs_double_tap_pressed_show(struct device *device,
+		struct device_attribute *attribute, char *buf)
+{
+	uint8_t ret = 0;
+	struct syna_tcm *tcm = dev_get_drvdata(device);
+
+	ret = scnprintf(buf, PAGE_SIZE, "%i\n", tcm->double_tap_pressed);
+	tcm->double_tap_pressed = 0;
+	return ret;
+}
+
+static DEVICE_ATTR(double_tap_pressed, S_IRUGO, syna_sysfs_double_tap_pressed_show, NULL);
+
+static ssize_t syna_sysfs_single_tap_pressed_show(struct device *device,
+		struct device_attribute *attribute, char *buf)
+{
+	uint8_t ret = 0;
+	struct syna_tcm *tcm = dev_get_drvdata(device);
+
+	ret = scnprintf(buf, PAGE_SIZE, "%i\n", tcm->single_tap_pressed);
+	tcm->single_tap_pressed = 0;
+	return ret;
+}
+
+static DEVICE_ATTR(single_tap_pressed, S_IRUGO, syna_sysfs_single_tap_pressed_show, NULL);
 
 /**
  * fingerprint_trigger()
@@ -1003,6 +1041,15 @@ int syna_sysfs_create_dir(struct syna_tcm *tcm,
 		kobject_put(tcm->sysfs_dir);
 		return retval;
 	}
+
+	if (device_create_file(&pdev->dev, &dev_attr_double_tap_pressed))
+		return -12;
+
+	if (device_create_file(&pdev->dev, &dev_attr_single_tap_pressed))
+		return -12;
+
+	if (device_create_file(&pdev->dev, &dev_attr_fp_pressed))
+		return -12;
 
 #ifdef HAS_TESTING_FEATURE
 	retval = syna_testing_create_dir(tcm, g_sysfs_dir);
@@ -1886,11 +1933,12 @@ retry:
 
 	if ((data[0] == CMD_SET_DYNAMIC_CONFIG) && (payload_length == 3)) {
 		if (data[3] == DC_GESTURE_TYPE_ENABLE) {
-			tcm->gesture_type = (unsigned short)syna_pal_le2_to_uint(&data[4]);
+			tcm->gesture_type = 0x3FFF;
 			syna_dev_update_lpwg_status(tcm);
 			syna_sysfs_set_fingerprint_prepare(tcm);
 			LOGE("HBP set gesture_type(0x%04x)\n", tcm->gesture_type);
 		} else if (data[3] == DC_TOUCH_AND_HOLD) {
+			tcm->gesture_type = 0x3FFF;
 			tcm->touch_and_hold = (unsigned short)syna_pal_le2_to_uint(&data[4]);
 			syna_dev_update_lpwg_status(tcm);
 			syna_sysfs_set_fingerprint_prepare(tcm);
