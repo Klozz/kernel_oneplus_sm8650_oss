@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+
+# Enable available and selected Clang AutoFDO features.
+
+CFLAGS_AUTOFDO_CLANG := -fdebug-info-for-profiling -mllvm -enable-fs-discriminator=true -mllvm -improved-fs-discriminator=true
+# for fuzzy profile matching
+CFLAGS_AUTOFDO_CLANG += -mllvm --salvage-stale-profile=true -mllvm --salvage-stale-profile-max-callsites=2000 -mllvm --salvage-unused-profile=true
+
+ifndef CONFIG_DEBUG_INFO
+  CFLAGS_AUTOFDO_CLANG += -gmlt
+endif
+
+CFLAGS_AUTOFDO_CLANG += -fprofile-sample-use=$(srctree)/kernel.afdo
+
+ifdef CONFIG_LTO_CLANG_THIN
+  KBUILD_LDFLAGS += --lto-sample-profile=$(srctree)/kernel.afdo
+  KBUILD_LDFLAGS += --mllvm=-enable-fs-discriminator=true --mllvm=-improved-fs-discriminator=true -plugin-opt=thinlto
+  # for fuzzy profile matching
+  KBUILD_LDFLAGS += --mllvm=-no-warn-sample-unused=true
+endif
+
+export CFLAGS_AUTOFDO_CLANG

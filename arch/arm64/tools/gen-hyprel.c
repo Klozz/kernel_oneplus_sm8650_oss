@@ -430,8 +430,12 @@ static void emit_all_relocs(void)
 	for_each_section(shdr) {
 		switch (elf32toh(shdr->sh_type)) {
 		case SHT_REL:
-			fatal_error("Unexpected SHT_REL section \"%s\"",
-				section_name(shdr));
+			const char *name = section_name(shdr);
+			if (strcmp(name, ".rel.llvm.call-graph-profile") != 0) {
+				fatal_error("Unexpected SHT_REL section \"%s\"",
+					section_name(shdr));
+			}
+			break;
 		case SHT_RELA:
 			emit_rela_section(shdr);
 			break;

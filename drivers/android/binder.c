@@ -54,6 +54,7 @@
 #include <linux/poll.h>
 #include <linux/debugfs.h>
 #include <linux/rbtree.h>
+#include <linux/sched/cputime.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
@@ -77,6 +78,8 @@
 #include "binder_internal.h"
 #include "binder_trace.h"
 #include <trace/hooks/binder.h>
+
+#include "../../kernel/sched/sched.h"
 
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
@@ -702,6 +705,48 @@ static bool binder_supported_policy(int policy)
 	return is_fair_policy(policy) || is_rt_policy(policy);
 }
 
+#ifdef CONFIG_UCLAMP_TASK
+static void set_binder_prio_uclamp(struct binder_priority *prio, struct task_struct *task)
+{
+	if (!uclamp_is_used())
+		return;
+
+	if (task) {
+		prio->uclamp[UCLAMP_MIN] = task->uclamp_req[UCLAMP_MIN].value;
+		prio->uclamp[UCLAMP_MAX] = task->uclamp_req[UCLAMP_MAX].value;
+	} else {
+		prio->uclamp[UCLAMP_MIN] = 0;
+		prio->uclamp[UCLAMP_MAX] = SCHED_CAPACITY_SCALE;
+	}
+}
+
+static void set_inherited_uclamp(struct binder_transaction *t)
+{
+	if (!uclamp_is_used())
+		return;
+
+	t->priority.uclamp[UCLAMP_MIN] = uclamp_eff_value(current, UCLAMP_MIN);
+	t->priority.uclamp[UCLAMP_MAX] = uclamp_eff_value(current, UCLAMP_MAX);
+}
+
+static bool is_uclamp_equal(struct task_struct *task, const struct binder_priority *desired)
+{
+	if (!uclamp_is_used())
+		return true;
+
+	return task->uclamp_req[UCLAMP_MIN].value == desired->uclamp[UCLAMP_MIN]
+		&& task->uclamp_req[UCLAMP_MAX].value == desired->uclamp[UCLAMP_MAX];
+}
+
+#else
+static void set_binder_prio_uclamp(struct binder_priority *prio, struct task_struct *task) { }
+static void set_inherited_uclamp(struct binder_transaction *t) { }
+static bool is_uclamp_equal(struct task_struct *task, const struct binder_priority *desired)
+{
+	return true;
+}
+#endif
+
 static int to_userspace_prio(int policy, int kernel_priority)
 {
 	if (is_fair_policy(policy))
@@ -726,8 +771,18 @@ static void binder_do_set_priority(struct binder_thread *thread,
 	int priority; /* user-space prio value */
 	bool has_cap_nice;
 	unsigned int policy = desired->sched_policy;
+	struct sched_attr attrs = {
+		.sched_flags = SCHED_FLAG_RESET_ON_FORK
+	};
 
-	if (task->policy == policy && task->normal_prio == desired->prio) {
+	if (uclamp_is_used()) {
+		attrs.sched_flags |= SCHED_FLAG_UTIL_CLAMP;
+		attrs.sched_util_min = desired->uclamp[UCLAMP_MIN];
+		attrs.sched_util_max = desired->uclamp[UCLAMP_MAX];
+	}
+
+	if (task->policy == policy && task->normal_prio == desired->prio
+		&& is_uclamp_equal(task, desired)) {
 		spin_lock(&thread->prio_lock);
 		if (thread->prio_state == BINDER_PRIO_PENDING)
 			thread->prio_state = BINDER_PRIO_SET;
@@ -787,16 +842,17 @@ static void binder_do_set_priority(struct binder_thread *thread,
 		return;
 	}
 
-	/* Set the actual priority */
+	/* Set the actual priority and uclamp */
 	if (task->policy != policy || is_rt_policy(policy)) {
-		struct sched_param params;
-
-		params.sched_priority = is_rt_policy(policy) ? priority : 0;
-
-		sched_setscheduler_nocheck(task,
-					   policy | SCHED_RESET_ON_FORK,
-					   &params);
+		attrs.sched_policy = policy;
+		attrs.sched_priority = is_rt_policy(policy) ? priority : 0;
+		attrs.sched_nice = PRIO_TO_NICE(task->static_prio);
+	} else {
+		attrs.sched_flags |= SCHED_FLAG_KEEP_ALL;
 	}
+
+	sched_setattr_nocheck(task, &attrs);
+
 	if (is_fair_policy(policy))
 		set_user_nice(task, priority);
 
@@ -852,7 +908,8 @@ static void binder_transaction_priority(struct binder_thread *thread,
 		 * SCHED_FIFO, prefer SCHED_FIFO, since it can
 		 * run unbounded, unlike SCHED_RR.
 		 */
-		desired = node_prio;
+		desired.prio = node_prio.prio;
+		desired.sched_policy = node_prio.sched_policy;
 	}
 
 	spin_lock(&thread->prio_lock);
@@ -871,6 +928,7 @@ static void binder_transaction_priority(struct binder_thread *thread,
 	} else {
 		t->saved_priority.sched_policy = task->policy;
 		t->saved_priority.prio = task->normal_prio;
+		set_binder_prio_uclamp(&t->saved_priority, task);
 	}
 	spin_unlock(&thread->prio_lock);
 
@@ -3511,6 +3569,9 @@ static void binder_transaction(struct binder_proc *proc,
 		/* Otherwise, fall back to the default priority */
 		t->priority = target_proc->default_priority;
 	}
+
+	if (!(t->flags & TF_ONE_WAY))
+		set_inherited_uclamp(t);
 
 	if (target_node && target_node->txn_security_ctx) {
 		u32 secid;
@@ -6290,6 +6351,8 @@ static int binder_open(struct inode *nodp, struct file *filp)
 		proc->default_priority.sched_policy = SCHED_NORMAL;
 		proc->default_priority.prio = NICE_TO_PRIO(0);
 	}
+
+	set_binder_prio_uclamp(&proc->default_priority, NULL);
 
 	/* binderfs stashes devices in i_private */
 	if (is_binderfs_device(nodp)) {
