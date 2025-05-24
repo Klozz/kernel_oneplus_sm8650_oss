@@ -1528,7 +1528,7 @@ static void shmem_pseudo_vma_destroy(struct vm_area_struct *vma)
 static struct folio *shmem_swapin(swp_entry_t swap, gfp_t gfp,
 			struct shmem_inode_info *info, pgoff_t index)
 {
-	struct vm_area_struct pvma;
+	struct vm_area_struct pvma = {};
 	struct page *page;
 	struct vm_fault vmf = {
 		.vma = &pvma,
@@ -1570,7 +1570,7 @@ static gfp_t limit_gfp_mask(gfp_t huge_gfp, gfp_t limit_gfp)
 static struct folio *shmem_alloc_hugefolio(gfp_t gfp,
 		struct shmem_inode_info *info, pgoff_t index)
 {
-	struct vm_area_struct pvma;
+	struct vm_area_struct pvma = {};
 	struct address_space *mapping = info->vfs_inode.i_mapping;
 	pgoff_t hindex;
 	struct folio *folio;
@@ -1591,7 +1591,7 @@ static struct folio *shmem_alloc_hugefolio(gfp_t gfp,
 static struct folio *shmem_alloc_folio(gfp_t gfp,
 			struct shmem_inode_info *info, pgoff_t index)
 {
-	struct vm_area_struct pvma;
+	struct vm_area_struct pvma = {};
 	struct folio *folio = NULL;
 
 	shmem_pseudo_vma_init(&pvma, info, index);

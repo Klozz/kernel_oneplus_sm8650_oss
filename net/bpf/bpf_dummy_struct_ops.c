@@ -33,7 +33,7 @@ dummy_ops_init_args(const union bpf_attr *kattr, unsigned int nr)
 	if (!args)
 		return ERR_PTR(-ENOMEM);
 
-	ctx_in = u64_to_user_ptr(kattr->test.ctx_in);
+	ctx_in = (void __user *)u64_to_user_ptr((u64)kattr->test.ctx_in);
 	if (copy_from_user(args->args, ctx_in, size_in))
 		goto out;
 
