@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  */
 
@@ -1288,10 +1289,15 @@ int mhi_gen_tre(struct mhi_controller *mhi_cntrl, struct mhi_chan *mhi_chan,
 	struct mhi_ring_element *mhi_tre;
 	struct mhi_buf_info *buf_info;
 	int eot, eob, chain, bei;
-	int ret;
+	int ret = 0;
 
 	/* Protect accesses for reading and incrementing WP */
 	write_lock_bh(&mhi_chan->lock);
+
+	if (mhi_chan->ch_state != MHI_CH_STATE_ENABLED) {
+		ret = -ENODEV;
+		goto out;
+	}
 
 	buf_ring = &mhi_chan->buf_ring;
 	tre_ring = &mhi_chan->tre_ring;
@@ -1310,10 +1316,8 @@ int mhi_gen_tre(struct mhi_controller *mhi_cntrl, struct mhi_chan *mhi_chan,
 
 	if (!info->pre_mapped) {
 		ret = mhi_cntrl->map_single(mhi_cntrl, buf_info);
-		if (ret) {
-			write_unlock_bh(&mhi_chan->lock);
-			return ret;
-		}
+		if (ret)
+			goto out;
 	}
 
 	eob = !!(flags & MHI_EOB);
@@ -1334,9 +1338,10 @@ int mhi_gen_tre(struct mhi_controller *mhi_cntrl, struct mhi_chan *mhi_chan,
 	mhi_add_ring_element(mhi_cntrl, tre_ring);
 	mhi_add_ring_element(mhi_cntrl, buf_ring);
 
+out:
 	write_unlock_bh(&mhi_chan->lock);
 
-	return 0;
+	return ret;
 }
 
 int mhi_queue_buf(struct mhi_device *mhi_dev, enum dma_data_direction dir,
@@ -1769,11 +1774,19 @@ EXPORT_SYMBOL_GPL(mhi_prepare_for_transfer_autoqueue);
 void mhi_unprepare_from_transfer(struct mhi_device *mhi_dev)
 {
 	struct mhi_controller *mhi_cntrl = mhi_dev->mhi_cntrl;
+	struct device *dev = &mhi_dev->dev;
 	struct mhi_chan *mhi_chan;
 	int dir;
 
 	/* Get out of suspended state */
-	mhi_cntrl->runtime_get(mhi_cntrl);
+	if (mhi_cntrl->runtime_get_sync) {
+		MHI_VERB(dev, "Calling runtime_get_sync()\n");
+		mhi_cntrl->runtime_get_sync(mhi_cntrl);
+	} else {
+		MHI_VERB(dev, "Calling runtime_get()\n");
+		mhi_cntrl->runtime_get(mhi_cntrl);
+	}
+
 	for (dir = 0; dir < 2; dir++) {
 		mhi_chan = dir ? mhi_dev->ul_chan : mhi_dev->dl_chan;
 		if (!mhi_chan)
@@ -1781,8 +1794,15 @@ void mhi_unprepare_from_transfer(struct mhi_device *mhi_dev)
 
 		mhi_unprepare_channel(mhi_cntrl, mhi_chan);
 	}
+
 	/* Allow suspend */
-	mhi_cntrl->runtime_put(mhi_cntrl);
+	if (mhi_cntrl->runtime_put_autosuspend) {
+		MHI_VERB(dev, "Calling runtime_put_autosuspend()\n");
+		mhi_cntrl->runtime_put_autosuspend(mhi_cntrl);
+	} else {
+		MHI_VERB(dev, "Calling runtime_put()\n");
+		mhi_cntrl->runtime_put(mhi_cntrl);
+	}
 }
 EXPORT_SYMBOL_GPL(mhi_unprepare_from_transfer);
 

@@ -1681,6 +1681,8 @@ static int bq27541_get_sub_gauge_battery_fcc(void)
 		}
 	}
 	sub_gauge_ic->fcc_pre = fcc;
+	bq27541_fcc_too_small_check(sub_gauge_ic, fcc);
+
 	return fcc;
 }
 
@@ -8739,6 +8741,7 @@ rerun:
 		return -EFAULT;
 	}
 
+	INIT_WORK(&fg_ic->fcc_too_small_check_work, bq27541_fcc_too_small_check_work);
 	if (fg_ic->batt_zy0603) {
 		rc = zy0603_parse_afi_buf(fg_ic);
 		dev_err(&client->dev, "zy0603 support and can't config gauge param\n");

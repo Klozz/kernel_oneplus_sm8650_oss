@@ -1376,9 +1376,14 @@ static ssize_t proc_report_rate_test_read(struct file *file, char __user *buffer
 	usleep_range(ts->report_rate_test_time * 1000 * 1000, ts->report_rate_test_time * 1000 * 1000 + 10);
 	ts->report_rate_testing = false;
 
-	snprintf(page, PAGESIZE - 1, "report frames:%u, rate:%uHZ. touch major avg:%u.\n",
-		ts->get_frame_num, ts->get_frame_num / ts->report_rate_test_time, (ts->touch_major_sum + ts->get_frame_num / 2) / ts->get_frame_num);
-	ret = simple_read_from_buffer(buffer, count, ppos, page, strlen(page));
+	if (ts->report_rate_test_time > 0 && ts->get_frame_num > 0) {
+		snprintf(page, PAGESIZE - 1, "report frames:%u, rate:%uHZ. touch major avg:%u.\n",
+			ts->get_frame_num, ts->get_frame_num / ts->report_rate_test_time, (ts->touch_major_sum + ts->get_frame_num / 2) / ts->get_frame_num);
+		ret = simple_read_from_buffer(buffer, count, ppos, page, strlen(page));
+	} else {
+		TP_INFO(ts->tp_index, "%s: get_frame_num or report_rate_test_time is 0.\n", __func__);
+	}
+
 	return ret;
 }
 
@@ -4738,7 +4743,7 @@ int init_touchpanel_proc_part3(struct touchpanel_data *ts, struct proc_dir_entry
 			ts->glove_mode_v2_support
 		},
 		{
-			"pocket_prevent_mode", 0666, NULL, &proc_pocket_prevent_mode, ts, false, true
+			"pocket_prevent_mode", 0666, NULL, &proc_pocket_prevent_mode, ts, false, ts->glove_mode_v2_support
 		},
 		{
 			"leather_cover_enable", 0666, NULL, &leather_cover_enable, ts, false,

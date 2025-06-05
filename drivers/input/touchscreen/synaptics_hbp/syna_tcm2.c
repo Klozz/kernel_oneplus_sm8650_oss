@@ -2292,6 +2292,14 @@ static void syna_speedup_resume(struct work_struct *work)
 
 	syna_send_signal(tcm, SIG_DISPLAY_ON);
 
+	/* We want to restore touch rate and glove mode to previous value */
+	retval = syna_tcm_set_dynamic_config(tcm->tcm_dev, 0xE6, tcm->touch_rate, RESP_IN_ATTN);
+	if (retval < 0)
+		LOGE("Failed to restore touch rate\n");
+
+	retval = syna_tcm_set_dynamic_config(tcm->tcm_dev, 0x0D, tcm->glove_mode, RESP_IN_ATTN);
+	if (retval < 0)
+		LOGE("Failed to restore touch rate\n");
 exit:
 	tcm->sub_pwr_state = SUB_PWR_RESUME_DONE;
 	tcm->slept_in_early_suspend = false;
@@ -2315,14 +2323,22 @@ exit:
  */
 static int syna_dev_suspend(struct device *dev)
 {
-#ifdef POWER_ALIVE_AT_SUSPEND
 	int retval;
-#endif
 	struct syna_tcm *tcm = dev_get_drvdata(dev);
 	struct syna_hw_interface *hw_if = tcm->hw_if;
 	bool irq_disabled = true;
 	u64 start_time = 0;
 	struct fp_underscreen_info fp_info;
+	unsigned short config = 0;
+
+	/* We want to remember high touch polling rate and glove mode state */
+	retval = syna_tcm_get_dynamic_config(tcm->tcm_dev, 0xE6, &config, 0);
+	if (retval >= 0)
+		tcm->touch_rate = config;
+
+	retval = syna_tcm_get_dynamic_config(tcm->tcm_dev, 0x0D, &config, 0);
+	if (retval >= 0)
+		tcm->glove_mode = config;
 
 	/* exit directly if device is already in suspend state */
 	if (tcm->pwr_state != PWR_ON)
@@ -3633,6 +3649,11 @@ static int syna_dev_probe(struct platform_device *pdev)
 		LOGI("%s: not in normal mode, return.\n", __func__);
 		return 0;
 	}
+
+	//set custom atomic adds
+	atomic_set(&tcm->single_tap_pressed, 0);
+	atomic_set(&tcm->double_tap_pressed, 0);
+	atomic_set(&tcm->fp_pressed, 0);
 
 #ifdef HAS_SYSFS_INTERFACE
 	/* create the device file and register to char device classes */

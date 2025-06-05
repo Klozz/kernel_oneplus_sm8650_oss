@@ -83,9 +83,23 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
 		return false;
 
-	if (unlikely(sg_policy->limits_changed)) {
-		sg_policy->limits_changed = false;
-		sg_policy->need_freq_update = cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS);
+	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
+		WRITE_ONCE(sg_policy->limits_changed, false);
+		sg_policy->need_freq_update = true;
+
+		/*
+		 * The above limits_changed update must occur before the reads
+		 * of policy limits in cpufreq_driver_resolve_freq() or a policy
+		 * limits update might be missed, so use a memory barrier to
+		 * ensure it.
+		 *
+		 * This pairs with the write memory barrier in sugov_limits().
+		 */
+		smp_mb();
+
+		return true;
+	} else if (sg_policy->need_freq_update) {
+		/* ignore_dl_rate_limit() wants a new frequency to be found. */
 		return true;
 	}
 
@@ -104,6 +118,20 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 				   unsigned int next_freq)
 {
+	if (sg_policy->need_freq_update) {
+		sg_policy->need_freq_update = false;
+		/*
+		 * The policy limits have changed, but if the return value of
+		 * cpufreq_driver_resolve_freq() after applying the new limits
+		 * is still equal to the previously selected frequency, the
+		 * driver callback need not be invoked unless the driver
+		 * specifically wants that to happen on every update of the
+		 * policy limits.
+		 */
+		if (cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+			goto must_update;
+	}
+
 	/*
 	 * When a frequency update isn't mandatory (!need_freq_update), the rate
 	 * limit is checked again upon frequency reduction because systems with
@@ -115,13 +143,12 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 	 * systems. A check for arch_scale_freq_invariant() is omitted here
 	 * because unconditionally rechecking the rate limit is cheaper.
 	 */
-	if (sg_policy->need_freq_update)
-		sg_policy->need_freq_update = false;
-	else if (next_freq == sg_policy->next_freq ||
-		 (next_freq < sg_policy->next_freq &&
-		  sugov_should_rate_limit(sg_policy, time)))
+	if (next_freq == sg_policy->next_freq ||
+	    (next_freq < sg_policy->next_freq &&
+	     sugov_should_rate_limit(sg_policy, time)))
 		return false;
 
+must_update:
 	sg_policy->next_freq = next_freq;
 	sg_policy->last_freq_update_time = time;
 
@@ -187,7 +214,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 
 	sg_policy->cached_raw_freq = freq;
 	l_freq = cpufreq_driver_resolve_freq(policy, freq);
-	idx = cpufreq_frequency_table_target(policy, freq, CPUFREQ_RELATION_H);
+	idx = cpufreq_frequency_table_target(policy, freq, policy->min, policy->max, CPUFREQ_RELATION_H);
 	h_freq = policy->freq_table[idx].frequency;
 	h_freq = clamp(h_freq, policy->min, policy->max);
 	if (l_freq <= h_freq || l_freq == policy->min)
@@ -379,7 +406,7 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
 {
 	if (cpu_bw_dl(cpu_rq(sg_cpu->cpu)) > sg_cpu->bw_min)
-		sg_cpu->sg_policy->limits_changed = true;
+		sg_cpu->sg_policy->need_freq_update = true;
 }
 
 static inline bool sugov_update_single_common(struct sugov_cpu *sg_cpu,
@@ -871,7 +898,16 @@ static void sugov_limits(struct cpufreq_policy *policy)
 		mutex_unlock(&sg_policy->work_lock);
 	}
 
-	sg_policy->limits_changed = true;
+	/*
+	 * The limits_changed update below must take place before the updates
+	 * of policy limits in cpufreq_set_policy() or a policy limits update
+	 * might be missed, so use a memory barrier to ensure it.
+	 *
+	 * This pairs with the memory barrier in sugov_should_update_freq().
+	 */
+	smp_wmb();
+
+	WRITE_ONCE(sg_policy->limits_changed, true);
 }
 
 struct cpufreq_governor schedutil_gov = {

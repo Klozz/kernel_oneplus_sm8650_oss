@@ -3209,7 +3209,7 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		dev_dbg(&pdev->dev, "%s:I2C Bus recovery enabled\n", __func__);
 	}
 
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	ret = dma_set_mask_and_coherent(&pdev->dev, ~0ULL);
 	if (ret) {
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (ret) {

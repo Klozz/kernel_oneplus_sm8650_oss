@@ -286,6 +286,7 @@ struct perf_event;
 #define PERF_PMU_CAP_NO_EXCLUDE			0x0080
 #define PERF_PMU_CAP_AUX_OUTPUT			0x0100
 #define PERF_PMU_CAP_EXTENDED_HW_TYPE		0x0200
+#define PERF_PMU_CAP_AUX_PREFER_LARGE		0x0400
 
 struct perf_output_handle;
 
@@ -936,7 +937,13 @@ struct perf_output_handle {
 	struct perf_buffer		*rb;
 	unsigned long			wakeup;
 	unsigned long			size;
-	u64				aux_flags;
+	union {
+		u64			flags;		/* perf_output*() */
+		u64			aux_flags;	/* perf_aux_output*() */
+		struct {
+			u64		skip_read : 1;
+		};
+	};
 	union {
 		void			*addr;
 		unsigned long		head;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #include "hab.h"
 
@@ -338,7 +338,7 @@ struct hab_device *find_hab_device(unsigned int mm_id)
 struct virtual_channel *frontend_open(struct uhab_context *ctx,
 		unsigned int mm_id,
 		int dom_id,
-		uint32_t flags)
+		uint32_t flags, int timeout)
 {
 	int ret, ret2, open_id = 0;
 	struct physical_channel *pchan = NULL;
@@ -391,7 +391,7 @@ struct virtual_channel *frontend_open(struct uhab_context *ctx,
 	/* Wait for Init-Ack sequence */
 	hab_open_request_init(&request, HAB_PAYLOAD_TYPE_INIT_ACK, pchan,
 		0, sub_id, open_id);
-	ret = hab_open_listen(ctx, dev, &request, &recv_request, 0, flags);
+	ret = hab_open_listen(ctx, dev, &request, &recv_request, timeout, flags);
 	if (!ret && recv_request && ((recv_request->xdata.ver_fe & 0xFFFF0000)
 		!= (recv_request->xdata.ver_be & 0xFFFF0000))) {
 		/* version check */
@@ -416,8 +416,11 @@ struct virtual_channel *frontend_open(struct uhab_context *ctx,
 				   vchan->id);
 		hab_open_pending_exit(ctx, pchan, &pending_open);
 
-		if (ret != -EINTR)
+		if (ret == -EAGAIN)
+			ret = -ETIMEDOUT;
+		else if (ret != -EINTR)
 			ret = -EINVAL;
+
 		goto err;
 	}
 
@@ -637,9 +640,14 @@ long hab_vchan_send(struct uhab_context *ctx,
 	}
 
 	vchan = hab_get_vchan_fromvcid(vcid, ctx, 0);
-	if (!vchan || vchan->otherend_closed) {
+	if (!vchan) {
+		pr_debug("cannot get vchan\n");
+		return -ENODEV;
+	}
+	if (vchan->otherend_closed) {
+		pr_debug("vchan %x is otherend closed\n", vchan->id);
 		ret = -ENODEV;
-		goto err;
+		goto err_otherend_closed;
 	}
 
 	/**
@@ -662,7 +670,8 @@ long hab_vchan_send(struct uhab_context *ctx,
 			pr_err("wrong profiling buffer size %zd, expect %zd\n",
 				sizebytes,
 				sizeof(struct habmm_xing_vm_stat));
-			return -EINVAL;
+			ret = -EINVAL;
+			goto err;
 		}
 	} else if (flags & HABMM_SOCKET_XVM_SCHE_TEST) {
 		HAB_HEADER_SET_TYPE(header, HAB_PAYLOAD_TYPE_SCHE_MSG);
@@ -673,7 +682,8 @@ long hab_vchan_send(struct uhab_context *ctx,
 			pr_err("Message buffer too small, %lu bytes, expect %d\n",
 				sizebytes,
 				sizeof(unsigned long long));
-			return -EINVAL;
+			ret = -EINVAL;
+			goto err;
 		}
 		HAB_HEADER_SET_TYPE(header, HAB_PAYLOAD_TYPE_SCHE_RESULT_REQ);
 	} else if (flags & HABMM_SOCKET_XVM_SCHE_RESULT_RSP) {
@@ -681,7 +691,8 @@ long hab_vchan_send(struct uhab_context *ctx,
 			pr_err("Message buffer too small, %lu bytes, expect %d\n",
 				sizebytes,
 				3 * sizeof(unsigned long long));
-			return -EINVAL;
+			ret = -EINVAL;
+			goto err;
 		}
 		HAB_HEADER_SET_TYPE(header, HAB_PAYLOAD_TYPE_SCHE_RESULT_RSP);
 	} else {
@@ -706,13 +717,12 @@ long hab_vchan_send(struct uhab_context *ctx,
 	 */
 	if (!ret)
 		atomic64_inc(&vchan->tx_cnt);
-err:
 
+err:
 	/* log msg send timestamp: exit hab_vchan_send */
 	trace_hab_vchan_send_done(vchan);
-
-	if (vchan)
-		hab_vchan_put(vchan);
+err_otherend_closed:
+	hab_vchan_put(vchan);
 
 	return ret;
 }
@@ -789,7 +799,7 @@ int hab_vchan_open(struct uhab_context *ctx,
 		if (ctx->lb_be)
 			vchan = backend_listen(ctx, mmid, timeout, flags);
 		else
-			vchan = frontend_open(ctx, mmid, LOOPBACK_DOM, flags);
+			vchan = frontend_open(ctx, mmid, LOOPBACK_DOM, flags, timeout);
 	} else {
 		dev = find_hab_device(mmid);
 
@@ -808,7 +818,7 @@ int hab_vchan_open(struct uhab_context *ctx,
 							timeout, flags);
 				else
 					vchan = frontend_open(ctx, mmid,
-							HABCFG_VMID_DONT_CARE, flags);
+							HABCFG_VMID_DONT_CARE, flags, timeout);
 			} else {
 				pr_err("open on nonexistent pchan (mmid %x)\n",
 					mmid);
