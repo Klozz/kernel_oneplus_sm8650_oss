@@ -118,6 +118,9 @@ int send_fingerprint_msg(int module, int event, void *data,
                              unsigned int size) {
     int ret = 0;
     int need_report = 0;
+    // Agrega variable estática para saber si la UI está lista
+    static bool fod_ui_ready = false;
+
     if (get_fp_driver_evt_type() != FP_DRIVER_INTERRUPT) {
         pr_info("%s, NETLINK is enable\n", __func__);
         return 0;
@@ -125,6 +128,10 @@ int send_fingerprint_msg(int module, int event, void *data,
     memset(&g_fingerprint_msg, 0, sizeof(g_fingerprint_msg));
     switch (module) {
     case E_FP_TP:
+        if (!fod_ui_ready) {
+            //pr_info("FOD_DEBUG: Ignoring TOUCHDOWN because UI not ready\n");
+            return 0;
+        }
         g_fingerprint_msg.module = E_FP_TP;
         g_fingerprint_msg.event = event == 1 ? E_FP_EVENT_TP_TOUCHDOWN : E_FP_EVENT_TP_TOUCHUP;
         g_fingerprint_msg.out_size = size <= MAX_MESSAGE_SIZE ? size : MAX_MESSAGE_SIZE;
@@ -135,6 +142,7 @@ int send_fingerprint_msg(int module, int event, void *data,
         g_fingerprint_msg.module = E_FP_LCD;
         g_fingerprint_msg.event =
             event == 1 ? E_FP_EVENT_UI_READY : E_FP_EVENT_UI_DISAPPEAR;
+        fod_ui_ready = (event == 1); // Save the state of UI_READY
         need_report = 1;
 
         //pr_info("kernel module:%d event:%d - %d", g_fingerprint_msg.module, event, g_fingerprint_msg.event);
@@ -163,6 +171,9 @@ int send_fingerprint_msg(int module, int event, void *data,
 #endif  // CONFIG_OPLUS_FEATURE_BSP_DRV_VND_INJECT_TEST || CONFIG_FP_INJECT_ENABLE
     pr_debug("%s, event_change:%d - %d, out_size:%d\n", __func__, event, g_fingerprint_msg.event, g_fingerprint_msg.out_size);
     pr_info("%s, module:%d, event:%d\n", __func__, g_fingerprint_msg.module, g_fingerprint_msg.event);
+    // Debug Fod
+    //pr_info("[FOD_DEBUG] send_fingerprint_msg: module=%d event=%d ui_ready=%d\n",
+    //    module, event, fod_ui_ready); enable for more debug
     if (need_report) {
         ret = wake_up_fingerprint_event(0);
     }
