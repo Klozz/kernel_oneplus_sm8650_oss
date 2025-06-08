@@ -1140,6 +1140,10 @@ bool out_of_memory(struct oom_control *oc)
 {
 	unsigned long freed = 0;
 
+	/* Return true since Simple LMK automatically kills in the background */
+	if (IS_ENABLED(CONFIG_ANDROID_SIMPLE_LMK))
+		return true;
+
 	if (oom_killer_disabled)
 		return false;
 
@@ -1230,6 +1234,7 @@ void pagefault_out_of_memory(void)
 		pr_warn("Huh VM_FAULT_OOM leaked out to the #PF handler. Retrying PF\n");
 }
 
+#ifndef CONFIG_ANDROID_SIMPLE_LMK
 SYSCALL_DEFINE2(process_mrelease, int, pidfd, unsigned int, flags)
 {
 #ifdef CONFIG_MMU
@@ -1293,6 +1298,7 @@ put_task:
 	return -ENOSYS;
 #endif /* CONFIG_MMU */
 }
+#endif
 
 void add_to_oom_reaper(struct task_struct *p)
 {
