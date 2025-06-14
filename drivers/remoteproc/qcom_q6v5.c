@@ -35,8 +35,8 @@
 
 #if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
 #include <soc/oplus/system/oplus_mm_kevent_fb.h>
-#define REMOTEPROC_ADSP "remoteproc-adsp"
 #endif /* CONFIG_OPLUS_FEATURE_MM_FEEDBACK */
+#define REMOTEPROC_ADSP "remoteproc-adsp"
 
 #define Q6V5_PANIC_DELAY_MS	200
 
