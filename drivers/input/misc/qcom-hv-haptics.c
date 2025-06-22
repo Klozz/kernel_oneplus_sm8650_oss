@@ -4107,18 +4107,13 @@ static int haptics_parse_per_effect_dt(struct haptics_chip *chip,
 		struct device_node *node, struct haptics_effect *effect)
 {
 	struct haptics_hw_config *config = &chip->config;
-	int rc, tmp;
+	int rc;
 
 	if (!effect)
 		return -EINVAL;
 
+	// Ignore wf-vmax-mv for consistency between primitive and traditional fifo effects
 	effect->vmax_mv = config->vmax_mv;
-	rc = of_property_read_u32(node, "qcom,wf-vmax-mv", &tmp);
-	if (rc < 0)
-		dev_dbg(chip->dev, "read qcom,wf-vmax-mv failed, rc=%d\n",
-				rc);
-	else
-		effect->vmax_mv = tmp;
 
 	if (effect->vmax_mv > MAX_VMAX_MV) {
 		dev_err(chip->dev, "qcom,wf-vmax-mv (%d) exceed the max value: %d\n",

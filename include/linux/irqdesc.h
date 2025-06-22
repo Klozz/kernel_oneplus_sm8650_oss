@@ -106,6 +106,9 @@ struct irq_desc {
 	int			parent_irq;
 	struct module		*owner;
 	const char		*name;
+#ifdef CONFIG_HARDIRQS_SW_RESEND
+	struct hlist_node	resend_node;
+#endif
 	ANDROID_VENDOR_DATA(1);
 } ____cacheline_internodealigned_in_smp;
 
