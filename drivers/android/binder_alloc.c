@@ -229,12 +229,22 @@ static int binder_install_single_page(struct binder_alloc *alloc,
 		return -ESRCH;
 
 	/*
+	 * Don't allocate page in mmap_write_lock, this can block
+	 * mmap_rwsem for a long time; Meanwhile, allocation failure
+	 * doesn't necessarily need to return -ENOMEM, if lru_page
+	 * has been installed, we can still return 0(success).
+	 */
+	page = alloc_page(GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
+
+	/*
 	 * Protected with mmap_sem in write mode as multiple tasks
 	 * might race to install the same page.
 	 */
 	mmap_write_lock(alloc->mm);
-	if (binder_get_installed_page(lru_page))
+	if (binder_get_installed_page(lru_page)) {
+		ret = 1;
 		goto out;
+	}
 
 	if (!alloc->vma) {
 		pr_err("%d: %s failed, no vma\n", alloc->pid, __func__);
@@ -242,7 +252,6 @@ static int binder_install_single_page(struct binder_alloc *alloc,
 		goto out;
 	}
 
-	page = alloc_page(GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO);
 	if (!page) {
 		pr_err("%d: failed to allocate page\n", alloc->pid);
 		ret = -ENOMEM;
@@ -254,7 +263,6 @@ static int binder_install_single_page(struct binder_alloc *alloc,
 		pr_err("%d: %s failed to insert page at offset %lx with %d\n",
 		       alloc->pid, __func__, addr - (uintptr_t)alloc->buffer,
 		       ret);
-		__free_page(page);
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -264,7 +272,9 @@ static int binder_install_single_page(struct binder_alloc *alloc,
 out:
 	mmap_write_unlock(alloc->mm);
 	mmput_async(alloc->mm);
-	return ret;
+	if (ret && page)
+		__free_page(page);
+	return ret < 0 ? ret : 0;
 }
 
 static int binder_install_buffer_pages(struct binder_alloc *alloc,
@@ -850,7 +860,7 @@ int binder_alloc_mmap_handler(struct binder_alloc *alloc,
 
 	alloc->buffer = (void __user *)vma->vm_start;
 
-	alloc->pages = kcalloc(alloc->buffer_size / PAGE_SIZE,
+	alloc->pages = kvcalloc(alloc->buffer_size / PAGE_SIZE,
 			       sizeof(alloc->pages[0]),
 			       GFP_KERNEL);
 	if (alloc->pages == NULL) {
@@ -883,7 +893,7 @@ int binder_alloc_mmap_handler(struct binder_alloc *alloc,
 	return 0;
 
 err_alloc_buf_struct_failed:
-	kfree(alloc->pages);
+	kvfree(alloc->pages);
 	alloc->pages = NULL;
 err_alloc_pages_failed:
 	alloc->buffer = 0;
@@ -957,7 +967,7 @@ void binder_alloc_deferred_release(struct binder_alloc *alloc)
 		}
 	}
 	binder_alloc_unlock(alloc);
-	kfree(alloc->pages);
+	kvfree(alloc->pages);
 	if (alloc->mm)
 		mmdrop(alloc->mm);
 

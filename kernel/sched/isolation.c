@@ -46,7 +46,7 @@ int housekeeping_any_cpu(enum hk_type type)
 			if (cpu < nr_cpu_ids)
 				return cpu;
 
-			return cpumask_any_and(housekeeping.cpumasks[type], cpu_online_mask);
+			return cpumask_any_and_distribute(housekeeping.cpumasks[type], cpu_online_mask);
 		}
 	}
 	return smp_processor_id();
