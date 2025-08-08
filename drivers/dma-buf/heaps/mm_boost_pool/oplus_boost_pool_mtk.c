@@ -22,6 +22,10 @@
 
 #include "oplus_boost_pool_mtk.h"
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+#include "../mm_osvelte/mm-config.h"
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
+
 #define CREATE_TRACE_POINTS
 #include "trace_dma_buf.h"
 EXPORT_TRACEPOINT_SYMBOL(dma_buf_alloc_start);
@@ -712,6 +716,16 @@ struct boost_pool *boost_pool_create(const char *name, bool smmu_v3_enable)
 	struct proc_dir_entry *proc_root;
 	struct proc_dir_entry *proc_low, *proc_min, *proc_alloc,
 			      *proc_cpu, *proc_custom_pid;
+
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+	struct config_oplus_boost_pool *config;
+
+	config = oplus_read_mm_config(module_name_boost_pool);
+	if (config && !config->enable) {
+		pr_info("%s is disabled in config\n", module_name_boost_pool);
+		return NULL;
+	}
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 
 	ret = boost_pool_mgr_init();
 	if (ret)

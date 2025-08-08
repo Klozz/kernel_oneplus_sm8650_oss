@@ -28,6 +28,10 @@
 
 #include "oplus_boost_pool.h"
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+#include "../mm_osvelte/mm-config.h"
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
+
 #define MAX_BOOST_POOL_HIGH (1024 * 256)
 
 #define K(x) ((x) << (PAGE_SHIFT-10))
@@ -1092,6 +1096,14 @@ struct dynamic_boost_pool *dynamic_boost_pool_create_pack(void)
 	struct dynamic_boost_pool *boost_pool = NULL;
 	struct proc_dir_entry *boost_root_dir;
 
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_OSVELTE)
+	struct config_oplus_boost_pool *config;
+	config = oplus_read_mm_config(module_name_boost_pool);
+	if (config && !config->enable) {
+		pr_info("%s is disabled in config\n", module_name_boost_pool);
+		return NULL;
+	}
+#endif /* CONFIG_OPLUS_FEATURE_MM_OSVELTE */
 	boost_root_dir = proc_mkdir("boost_pool", NULL);
 	if (!IS_ERR_OR_NULL(boost_root_dir)) {
 		int sf_pages = PAGES(SZ_32M), camera_pages = 0;

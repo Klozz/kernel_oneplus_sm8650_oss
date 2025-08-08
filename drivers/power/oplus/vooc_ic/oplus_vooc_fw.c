@@ -110,7 +110,6 @@ bool __attribute__((weak)) qpnp_is_power_off_charging(void)
 	return false;
 }
 #endif
-#endif
 
 extern	int oplus_vooc_mcu_hwid_check(struct oplus_vooc_chip *chip);
 extern int oplus_vooc_asic_hwid_check(struct oplus_vooc_chip *chip);
@@ -481,6 +480,8 @@ void oplus_vooc_fw_type_dt(struct oplus_vooc_chip *chip)
 			chg_err("vooc_current_lvl[%d]\n", chip->vooc_current_lvl[loop]);
 		}
 	}
+	of_property_read_u32(node, "oplus,vooc_1time_full_volt", &chip->vooc_1time_full_volt);
+	of_property_read_u32(node, "oplus,vooc_ntime_full_volt", &chip->vooc_ntime_full_volt);
 	chip->batt_type_4400mv = of_property_read_bool(node, "qcom,oplus_batt_4400mv");
 	chip->support_vooc_by_normal_charger_path = of_property_read_bool(node,
 		"qcom,support_vooc_by_normal_charger_path");
