@@ -25,6 +25,7 @@
 static struct lock_class_key irq_desc_lock_class;
 
 #if defined(CONFIG_SMP)
+#ifndef CONFIG_IRQ_SBALANCE
 static int __init irq_affinity_setup(char *str)
 {
 	alloc_bootmem_cpumask_var(&irq_default_affinity);
@@ -37,6 +38,7 @@ static int __init irq_affinity_setup(char *str)
 	return 1;
 }
 __setup("irqaffinity=", irq_affinity_setup);
+#endif
 
 static void __init init_irq_default_affinity(void)
 {

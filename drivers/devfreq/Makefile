@@ -22,3 +22,7 @@ obj-$(CONFIG_QCOM_BIMC_BWMON)		+= bimc-bwmon.o
 
 # DEVFREQ Event Drivers
 obj-$(CONFIG_PM_DEVFREQ_EVENT)		+= event/
+
+obj-y += tensor_aio.o
+
+CFLAGS_tensor_aio.o := -I$(srctree)/kernel/sched
