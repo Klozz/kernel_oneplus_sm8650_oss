@@ -473,6 +473,8 @@ static inline unsigned long total_swapcache_pages(void)
 }
 
 extern void free_swap_cache(struct page *page);
+int kcompressd(void *p);
+
 extern void free_page_and_swap_cache(struct page *);
 extern void free_pages_and_swap_cache(struct page **, int);
 /* linux/mm/swapfile.c */
@@ -622,6 +624,12 @@ static inline int add_swap_extent(struct swap_info_struct *sis,
 {
 	return -EINVAL;
 }
+
+static inline int kcompressd(void *p)
+{
+	return 0;
+}
+
 #endif /* CONFIG_SWAP */
 
 #ifdef CONFIG_THP_SWAP

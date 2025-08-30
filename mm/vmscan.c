@@ -8001,6 +8001,7 @@ void kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
 	bool skip = false;
+	int ret;
 
 	pgdat_kswapd_lock(pgdat);
 	if (!pgdat->kswapd) {
@@ -8019,6 +8020,25 @@ void kswapd_run(int nid)
 		}
 	}
 	pgdat_kswapd_unlock(pgdat);
+
+	ret = kfifo_alloc(&pgdat->kcompress_fifo,
+			KCOMPRESS_FIFO_SIZE * sizeof(struct folio *),
+			GFP_KERNEL);
+	if (ret) {
+		pr_err("%s: fail to kfifo_alloc\n", __func__);
+		return;
+	}
+
+	pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
+			"kcompressd%d", nid);
+	if (IS_ERR(pgdat->kcompressd)) {
+		pr_err("Failed to start kcompressd on node %d，ret=%ld\n",
+				nid, PTR_ERR(pgdat->kcompressd));
+		pgdat->kcompressd = NULL;
+		kfifo_free(&pgdat->kcompress_fifo);
+	} else {
+		wake_up_process(pgdat->kcompressd);
+	}
 }
 
 /*
@@ -8028,7 +8048,7 @@ void kswapd_run(int nid)
 void kswapd_stop(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
-	struct task_struct *kswapd;
+	struct task_struct *kswapd = pgdat->kswapd;
 	bool skip = false;
 
 	pgdat_kswapd_lock(pgdat);
@@ -8042,6 +8062,12 @@ void kswapd_stop(int nid)
 	if (kswapd) {
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
+	}
+
+	if (pgdat->kcompressd) {
+		kthread_stop(pgdat->kcompressd);
+		pgdat->kcompressd = NULL;
+		kfifo_free(&pgdat->kcompress_fifo);
 	}
 	pgdat_kswapd_unlock(pgdat);
 }
