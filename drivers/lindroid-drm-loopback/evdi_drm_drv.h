@@ -128,7 +128,8 @@ struct evdi_painter {
 	struct drm_pending_vblank_event *vblank;
 
 	struct list_head pending_events;
-	struct delayed_work send_events_work;
+	struct work_struct send_events_now;
+	struct delayed_work send_events_retry;
 
 	struct notifier_block vt_notifier;
 	int fg_console;

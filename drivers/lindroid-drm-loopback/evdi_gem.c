@@ -171,7 +171,7 @@ static int evdi_align_pitch(int width, int cpp)
 int evdi_dumb_create(struct drm_file *file,
 		     struct drm_device *dev, struct drm_mode_create_dumb *args)
 {
-	printk("evdi_dumb_create!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+	EVDI_INFO("evdi_dumb_create!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 	args->pitch = evdi_align_pitch(args->width, DIV_ROUND_UP(args->bpp, 8));
 
 	args->size = args->pitch * args->height;
@@ -428,9 +428,9 @@ int evdi_gem_mmap(struct drm_file *file,
 void print_dma_buf_owner(struct dma_buf *dmabuf) {
     if (dmabuf && dmabuf->owner) {
         const char *module_name = module_name(dmabuf->owner);
-        pr_info("DMA-BUF created by module: %s\n", module_name);
+        EVDI_INFO("DMA-BUF created by module: %s\n", module_name);
     } else {
-        pr_info("No owner information available for this DMA-BUF\n");
+        EVDI_INFO("No owner information available for this DMA-BUF\n");
     }
 }
 
@@ -442,8 +442,9 @@ evdi_prime_import_sg_table(struct drm_device *dev,
 	struct evdi_gem_object *obj;
 	int npages;
 	bool called_by_mutter;
-printk("evdi_prime_import_sg_table");
-print_dma_buf_owner(attach->dmabuf);
+
+	EVDI_INFO("evdi_prime_import_sg_table");
+	print_dma_buf_owner(attach->dmabuf);
 	called_by_mutter = evdi_was_called_by_mutter();
 
 	obj = evdi_gem_alloc_object(dev, attach->dmabuf->size);

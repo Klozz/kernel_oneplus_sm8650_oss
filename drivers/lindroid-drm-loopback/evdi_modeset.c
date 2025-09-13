@@ -32,6 +32,7 @@
 #include "evdi_drm_drv.h"
 #include "evdi_cursor.h"
 #include "evdi_params.h"
+#include "evdi_debug.h"
 #if KERNEL_VERSION(5, 13, 0) <= LINUX_VERSION_CODE || defined(EL8)
 #include <drm/drm_gem_atomic_helper.h>
 #else
@@ -242,13 +243,13 @@ int evdi_atomic_helper_page_flip(struct drm_crtc *crtc,
 	wake_up(&evdi->poll_ioct_wq);
 	ret = wait_event_interruptible(ev_event->wait, ev_event->completed);
 	if (ret < 0) {
-		printk("evdi_gbm_add_buf_ioctl: wait_event_interruptible interrupted: %d\n", ret);
+		EVDI_INFO("evdi_gbm_add_buf_ioctl: wait_event_interruptible interrupted: %d\n", ret);
 		return ret;
 	}
 
 	ret = ev_event->result;
 	if (ret < 0) {
-		pr_err("evdi_gbm_add_buf_ioctl: user ioctl failled\n");
+		EVDI_ERROR("evdi_gbm_add_buf_ioctl: user ioctl failled\n");
 		return ret;
 	}
 
@@ -565,7 +566,7 @@ static int evdi_crtc_init(struct drm_device *dev)
 
 int evdi_atomic_helper_commit(struct drm_device * dev, struct drm_atomic_state * state, bool nonblock)
 {
-	printk("evdi_atomic_helper_commit\n");
+	EVDI_INFO("evdi_atomic_helper_commit\n");
 	return drm_atomic_helper_commit(dev, state, nonblock);
 }
 static const struct drm_mode_config_funcs evdi_mode_funcs = {

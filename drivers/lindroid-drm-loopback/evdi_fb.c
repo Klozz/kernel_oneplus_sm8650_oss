@@ -26,6 +26,7 @@
 #include <drm/drm_damage_helper.h>
 #endif
 #include "evdi_drm_drv.h"
+#include "evdi_debug.h"
 
 
 struct evdi_fbdev {
@@ -198,13 +199,13 @@ static void evdi_user_framebuffer_destroy(struct drm_framebuffer *fb)
 	wake_up(&evdi->poll_ioct_wq);
 	ret = wait_event_interruptible(event->wait, event->completed);
 	if (ret < 0) {
-		printk("evdi_gbm_add_buf_ioctl: wait_event_interruptible interrupted: %d\n", ret);
+		EVDI_ERROR("evdi_gbm_add_buf_ioctl: wait_event_interruptible interrupted: %d\n", ret);
 		return;
 	}
 
 	ret = event->result;
 	if (ret < 0) {
-		pr_err("evdi_gbm_add_buf_ioctl: user ioctl failled\n");
+		EVDI_ERROR("evdi_gbm_add_buf_ioctl: user ioctl failled\n");
 		return;
 	}
 
@@ -294,14 +295,14 @@ struct drm_framebuffer *evdi_fb_user_fb_create(
 
 	memfd_file = fget(mode_cmd->handles[0]);
 	if (!memfd_file) {
-		printk("Failed to open fake fb: %d\n", mode_cmd->handles[0]);
+		EVDI_ERROR("Failed to open fake fb: %d\n", mode_cmd->handles[0]);
 		return ERR_PTR(-EINVAL);
 	}
 
 	pos = 0;
 	bytes_read = kernel_read(memfd_file, &id, sizeof(id), &pos);
 	if (bytes_read != sizeof(id)) {
-		printk("Failed to read id from memfd, bytes_read=%zd\n", bytes_read);
+		EVDI_ERROR("Failed to read id from memfd, bytes_read=%zd\n", bytes_read);
 		return ERR_PTR(-EIO);
 	}
 
