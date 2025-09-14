@@ -1164,7 +1164,7 @@ static int haptics_get_status_data(struct haptics_chip *chip,
 		"RNAT_RCAL_INT",
 		"BRAKE_CAL_SCALAR",
 	};
-	const char *name;
+	const char *name = "UNKNOWN_STATUS"; // Initialize with default value
 
 	mod_sel_val[0] = sel & 0xff;
 	mod_sel_val[1] = (sel >> 8) & 0xff;
