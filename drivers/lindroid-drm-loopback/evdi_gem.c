@@ -107,8 +107,6 @@ struct evdi_gem_object *evdi_gem_alloc_object(struct drm_device *dev,
 	obj->base.funcs = &gem_obj_funcs;
 #endif
 
-	obj->allow_sw_cursor_rect_updates = false;
-
 	mutex_init(&obj->pages_lock);
 
 	return obj;
@@ -128,7 +126,6 @@ evdi_gem_create(struct drm_file *file,
 	if (obj == NULL)
 		return -ENOMEM;
 
-	obj->allow_sw_cursor_rect_updates = evdi_was_called_by_mutter();
 	ret = drm_gem_handle_create(file, &obj->base, &handle);
 	if (ret) {
 		drm_gem_object_release(&obj->base);
@@ -465,7 +462,6 @@ evdi_prime_import_sg_table(struct drm_device *dev,
 	drm_prime_sg_to_page_addr_arrays(sg, obj->pages, NULL, npages);
 #endif
 	obj->sg = sg;
-	obj->allow_sw_cursor_rect_updates = called_by_mutter;
 	return &obj->base;
 }
 

@@ -17,6 +17,14 @@
 #include <linux/version.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
+#include <linux/atomic.h>
+#include <linux/completion.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0) || defined(EL8) || defined(EL9)
+#include <linux/xarray.h>
+#define EVDI_HAVE_XARRAY	1
+#else
+#undef EVDI_HAVE_XARRAY
+#endif
 #if KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE || defined(EL8) || defined(EL9)
 #include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
@@ -40,14 +48,16 @@
 #include "evdi_drm.h"
 #include "tests/evdi_test.h"
 
+#define EVDI_WAIT_TIMEOUT (10*HZ)
+#define EVDI_MAX_FDS   32
+#define EVDI_MAX_INTS  256
+
 struct evdi_fbdev;
 struct evdi_painter;
 
 struct evdi_device {
 	struct drm_device *ddev;
 	struct drm_connector *conn;
-	struct evdi_cursor *cursor;
-	bool cursor_events_enabled;
 
 	uint32_t pixel_area_limit;
 	uint32_t pixel_per_second_limit;
@@ -62,12 +72,17 @@ struct evdi_device {
 	wait_queue_head_t poll_ioct_wq;
 	wait_queue_head_t poll_response_ioct_wq;
 	struct mutex poll_lock;
+	atomic_t poll_stopping;
 	struct completion poll_completion;
 	int last_buf_add_id;
 	void *last_got_buff;
-	struct mutex event_lock;
+	spinlock_t event_lock;
 	struct list_head event_queue;
+#if defined(EVDI_HAVE_XARRAY)
+	struct xarray event_xa;
+#else
 	struct idr event_idr;
+#endif
 	atomic_t next_event_id;
 };
 
@@ -76,12 +91,13 @@ struct evdi_event {
 	void *data;
 	void *reply_data;
 	int poll_id;
-	wait_queue_head_t wait;
-	bool completed;
-	int result;
-
+	bool on_queue;
+	struct drm_file *owner;
 	struct list_head list;
 	struct evdi_device *evdi;
+#if defined(EVDI_HAVE_XARRAY)
+	struct rcu_head	rcu;
+#endif
 };
 
 struct evdi_gem_object {
@@ -94,7 +110,6 @@ struct evdi_gem_object {
 	bool vmap_is_iomem;
 #endif
 	struct sg_table *sg;
-	bool allow_sw_cursor_rect_updates;
 };
 
 #define to_evdi_bo(x) container_of(x, struct evdi_gem_object, base)
@@ -104,6 +119,7 @@ struct evdi_framebuffer {
 	struct evdi_gem_object *obj;
 	bool active;
 	int gralloc_buf_id;
+	struct drm_file *owner;
 };
 
 #define MAX_DIRTS 16
@@ -139,8 +155,8 @@ struct evdi_gralloc_buf {
 	int version;
 	int numFds;
 	int numInts;
-	struct file **data_files;
-	int *data_ints;
+	struct file *data_files[EVDI_MAX_FDS];
+	int data_ints[EVDI_MAX_INTS];
 	struct file *memfd_file;
 };
 
@@ -154,7 +170,8 @@ struct evdi_gralloc_buf_user {
 #define to_evdi_fb(x) container_of(x, struct evdi_framebuffer, base)
 
 
-struct evdi_event *evdi_create_event(struct evdi_device *evdi, enum poll_event_type type, void *data);
+struct evdi_event *evdi_create_event(struct evdi_device *evdi, enum poll_event_type type, void *data, struct drm_file *file);
+void evdi_event_unlink_and_free(struct evdi_device *evdi, struct evdi_event *event);
 
 int evdi_poll_ioctl(struct drm_device *drm_dev, void *data,
                     struct drm_file *file);
@@ -169,10 +186,6 @@ struct drm_encoder *evdi_encoder_init(struct drm_device *dev);
 int evdi_driver_open(struct drm_device *drm_dev, struct drm_file *file);
 void evdi_driver_preclose(struct drm_device *dev, struct drm_file *file_priv);
 void evdi_driver_postclose(struct drm_device *dev, struct drm_file *file_priv);
-
-#ifdef CONFIG_COMPAT
-long evdi_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
-#endif
 
 struct drm_framebuffer *evdi_fb_user_fb_create(
 				struct drm_device *dev,
@@ -209,9 +222,6 @@ int evdi_gem_fault(struct vm_fault *vmf);
 
 bool evdi_painter_is_connected(struct evdi_painter *painter);
 void evdi_painter_close(struct evdi_device *evdi, struct drm_file *file);
-int evdi_painter_get_num_dirts(struct evdi_painter *painter);
-void evdi_painter_mark_dirty(struct evdi_device *evdi,
-			     const struct drm_clip_rect *rect);
 void evdi_painter_send_vblank(struct evdi_painter *painter);
 void evdi_painter_set_vblank(struct evdi_painter *painter,
 			     struct drm_crtc *crtc,
@@ -227,12 +237,8 @@ int evdi_painter_status_ioctl(struct drm_device *drm_dev, void *data,
 			      struct drm_file *file);
 int evdi_painter_connect_ioctl(struct drm_device *drm_dev, void *data,
 			       struct drm_file *file);
-int evdi_painter_grabpix_ioctl(struct drm_device *drm_dev, void *data,
-			       struct drm_file *file);
 int evdi_painter_request_update_ioctl(struct drm_device *drm_dev, void *data,
 				      struct drm_file *file);
-int evdi_painter_enable_cursor_events_ioctl(struct drm_device *drm_dev, void *data,
-					  struct drm_file *file);
 
 int evdi_painter_init(struct evdi_device *evdi);
 void evdi_painter_cleanup(struct evdi_painter *painter);
@@ -246,13 +252,10 @@ struct drm_clip_rect evdi_framebuffer_sanitize_rect(
 struct drm_device *evdi_drm_device_create(struct device *parent);
 int evdi_drm_device_remove(struct drm_device *dev);
 
-void evdi_painter_send_cursor_set(struct evdi_painter *painter,
-				  struct evdi_cursor *cursor);
-void evdi_painter_send_cursor_move(struct evdi_painter *painter,
-				   struct evdi_cursor *cursor);
 bool evdi_painter_needs_full_modeset(struct evdi_painter *painter);
 void evdi_painter_force_full_modeset(struct evdi_painter *painter);
 struct drm_clip_rect evdi_painter_framebuffer_size(struct evdi_painter *painter);
 
 int evdi_fb_get_bpp(uint32_t format);
+void evdi_event_free(struct evdi_event *e);
 #endif

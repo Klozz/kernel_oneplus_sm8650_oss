@@ -22,8 +22,6 @@
 #define DRM_EVDI_EVENT_DPMS          0x80000001
 #define DRM_EVDI_EVENT_MODE_CHANGED  0x80000002
 #define DRM_EVDI_EVENT_CRTC_STATE    0x80000003
-#define DRM_EVDI_EVENT_CURSOR_SET    0x80000004
-#define DRM_EVDI_EVENT_CURSOR_MOVE   0x80000005
 
 enum poll_event_type {
   none,
@@ -82,30 +80,6 @@ struct drm_evdi_grabpix {
 	unsigned char __user *buffer;
 	int32_t num_rects;
 	struct drm_clip_rect __user *rects;
-};
-
-struct drm_evdi_event_cursor_set {
-	struct drm_event base;
-	int32_t hot_x;
-	int32_t hot_y;
-	uint32_t width;
-	uint32_t height;
-	uint8_t enabled;
-	uint32_t buffer_handle;
-	uint32_t buffer_length;
-	uint32_t pixel_format;
-	uint32_t stride;
-};
-
-struct drm_evdi_event_cursor_move {
-	struct drm_event base;
-	int32_t x;
-	int32_t y;
-};
-
-struct drm_evdi_enable_cursor_events {
-	struct drm_event base;
-	uint8_t enable;
 };
 
 struct drm_evdi_poll {
@@ -168,7 +142,6 @@ struct drm_evdi_gbm_get_buff {
 #define DRM_EVDI_CONNECT          0x00
 #define DRM_EVDI_REQUEST_UPDATE   0x01
 #define DRM_EVDI_GRABPIX          0x02
-#define DRM_EVDI_ENABLE_CURSOR_EVENTS 0x03
 #define DRM_EVDI_POLL 0x04
 #define DRM_EVDI_GBM_ADD_BUFF 0x05
 #define DRM_EVDI_GBM_GET_BUFF 0x06
@@ -188,8 +161,6 @@ struct drm_evdi_gbm_get_buff {
 	DRM_EVDI_REQUEST_UPDATE, struct drm_evdi_request_update)
 #define DRM_IOCTL_EVDI_GRABPIX DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_GRABPIX, struct drm_evdi_grabpix)
-#define DRM_IOCTL_EVDI_ENABLE_CURSOR_EVENTS DRM_IOWR(DRM_COMMAND_BASE +  \
-	DRM_EVDI_ENABLE_CURSOR_EVENTS, struct drm_evdi_enable_cursor_events)
 #define DRM_IOCTL_EVDI_POLL DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_POLL, struct drm_evdi_poll)
 #define DRM_IOCTL_EVDI_GBM_ADD_BUFF DRM_IOWR(DRM_COMMAND_BASE +  \

@@ -123,9 +123,6 @@ static int evdi_user_framebuffer_dirty(
 	}
 	state->acquire_ctx = &ctx;
 
-	for (i = 0; i < num_clips; ++i)
-		evdi_painter_mark_dirty(evdi, &clips[i]);
-
 retry:
 
 	drm_for_each_plane(plane, fb->dev) {
@@ -171,7 +168,7 @@ static int evdi_user_framebuffer_create_handle(struct drm_framebuffer *fb,
 					       unsigned int *handle)
 {
 	struct evdi_framebuffer *efb = to_evdi_fb(fb);
-
+	efb->owner = file_priv;
 	return drm_gem_handle_create(file_priv, &efb->obj->base, handle);
 }
 
@@ -181,7 +178,6 @@ static void evdi_user_framebuffer_destroy(struct drm_framebuffer *fb)
 	struct drm_device *dev = efb->base.dev;
 	struct evdi_device *evdi = dev->dev_private;
 	struct evdi_event *event;
-	int ret;
 	
 	EVDI_CHECKPT();
 	if (efb->obj)
@@ -192,37 +188,25 @@ static void evdi_user_framebuffer_destroy(struct drm_framebuffer *fb)
 #endif
 	drm_framebuffer_cleanup(fb);
 
-	event = evdi_create_event(evdi, destroy_buf, &efb->gralloc_buf_id);
+	if (!evdi_painter_is_connected(evdi->painter)) {
+		kfree(efb);
+		return;
+	}
+
+	event = evdi_create_event(evdi, destroy_buf, &efb->gralloc_buf_id, efb->owner);
 	if (!event)
 		return;
 
-	wake_up(&evdi->poll_ioct_wq);
-	ret = wait_event_interruptible(event->wait, event->completed);
-	if (ret < 0) {
-		EVDI_ERROR("evdi_gbm_add_buf_ioctl: wait_event_interruptible interrupted: %d\n", ret);
-		return;
-	}
-
-	ret = event->result;
-	if (ret < 0) {
-		EVDI_ERROR("evdi_gbm_add_buf_ioctl: user ioctl failled\n");
-		return;
-	}
-
-	mutex_lock(&evdi->event_lock);
-	idr_remove(&evdi->event_idr, event->poll_id);
-	mutex_unlock(&evdi->event_lock);
-	kfree(event);
-
+	wake_up_interruptible(&evdi->poll_ioct_wq);
 	kfree(efb);
 }
 
-	int evdi_atomic_helper_dirtyfb(struct drm_framebuffer *framebuffer,
+int evdi_atomic_helper_dirtyfb(struct drm_framebuffer *framebuffer,
 		     struct drm_file *file_priv, unsigned flags,
 		     unsigned color, struct drm_clip_rect *clips,
 		     unsigned num_clips){
-				 return 0;
-			}
+	return 0;
+}
 
 static const struct drm_framebuffer_funcs evdifb_funcs = {
 	.create_handle = evdi_user_framebuffer_create_handle,

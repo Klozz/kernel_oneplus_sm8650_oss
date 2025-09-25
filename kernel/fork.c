@@ -99,6 +99,7 @@
 #include <linux/bpf.h>
 #include <linux/tick.h>
 #include <linux/cpufreq_times.h>
+#include <linux/cpu_boost.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -2841,6 +2842,10 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 	    (args->flags & CLONE_PARENT_SETTID) &&
 	    (args->pidfd == args->parent_tid))
 		return -EINVAL;
+
+	/* Boost CPUs to the max for 100 ms when userspace launches an app */
+	if (task_is_zygote(current))
+		cpu_boost_all(100);
 
 	/*
 	 * Determine whether and which event to report to ptracer.  When
