@@ -2812,6 +2812,8 @@ struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
 	return copy_process(NULL, 0, node, &args);
 }
 
+extern int kp_active_mode(void);
+
 /*
  *  Ok, this is the main fork-routine.
  *
@@ -2844,8 +2846,8 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 		return -EINVAL;
 
 	/* Boost CPUs to the max for 100 ms when userspace launches an app */
-	if (task_is_zygote(current))
-		cpu_boost_all(100);
+	if (task_is_zygote(current) && kp_active_mode() != 1)
+		cpu_boost_max(100);
 
 	/*
 	 * Determine whether and which event to report to ptracer.  When

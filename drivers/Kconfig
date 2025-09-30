@@ -241,4 +241,6 @@ source "drivers/hte/Kconfig"
 
 source "drivers/lindroid-drm-loopback/Kconfig"
 
+source "drivers/kprofiles/Kconfig"
+
 endmenu

@@ -190,3 +190,4 @@ obj-$(CONFIG_MOST)		+= most/
 obj-$(CONFIG_PECI)		+= peci/
 obj-$(CONFIG_HTE)		+= hte/
 obj-$(CONFIG_DRM_LINDROID_EVDI)	+= lindroid-drm-loopback/
+obj-$(CONFIG_KPROFILES)		+= kprofiles/
