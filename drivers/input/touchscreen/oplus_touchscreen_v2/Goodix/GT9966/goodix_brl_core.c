@@ -4218,7 +4218,6 @@ exit:
 
 /************** Start of auto test func**************************/
 #define ABS(val)			((val < 0)? -(val) : val)
-#define MAX(a, b)			((a > b)? a : b)
 static void goodix_cache_deltadata(struct chip_data_brl *chip_data)
 {
 	u32 data_size;
