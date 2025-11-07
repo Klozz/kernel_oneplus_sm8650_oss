@@ -86,7 +86,7 @@ oplus_network_oem_qmi-y := oem_qmi_client.o
 obj-$(CONFIG_OEM_QMI)	+= oplus_network_oem_qmi.o
 #endif
 
-obj-$(CONFIG_OPLUS_GPIO) += oplus_network_esim.o
+obj-$(CONFIG_OPLUS_GPIO) += oplus_network_esim.o oplus_esim_auto_switch.o
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
 obj-$(CONFIG_AW8697_HAPTIC) += vibrator/aw8697_haptic/
