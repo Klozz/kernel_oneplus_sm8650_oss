@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Lock-free event system for Lindroid
+ * Copyright (C) 2012 Red Hat
+ * Copyright (c) 2015 - 2020 DisplayLink (UK) Ltd.
+ * Copyright (c) 2025 Lindroid Authors
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License v2. See the file COPYING in the main directory of this archive for
+ * more details.
  */
 
 #include "evdi_drv.h"
@@ -353,7 +359,10 @@ struct evdi_event *evdi_event_alloc(struct evdi_device *evdi,
 				   struct drm_file *owner)
 {
 	struct evdi_event *event;
-	int cur_alloc, peak, new_peak;
+	int cur_alloc, peak;
+#ifdef EVDI_HAVE_ATOMIC_CMPXCHG_RELAXED
+	int new_peak;
+#endif
 	gfp_t gfp = GFP_ATOMIC;
 
 	event = evdi_pcpu_event_pop();

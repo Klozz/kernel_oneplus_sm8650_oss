@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Main driver core
+ * Copyright (C) 2012 Red Hat
+ * Copyright (c) 2015 - 2020 DisplayLink (UK) Ltd.
+ * Copyright (c) 2025 Lindroid Authors
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License v2. See the file COPYING in the main directory of this archive for
+ * more details.
  */
 
 #include "evdi_drv.h"
@@ -263,10 +269,6 @@ static int evdi_platform_probe(struct platform_device *pdev)
 		evdi_err("Failed to initialize modeset: %d", ret);
 		goto err_modeset;
 	}
-
-#if EVDI_HAVE_ATOMIC_HELPERS
-	drm_mode_config_reset(ddev);
-#endif
 
 	ret = drm_vblank_init(ddev, LINDROID_MAX_CONNECTORS);
 	if (ret)

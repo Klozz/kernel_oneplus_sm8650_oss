@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * EVDI minimal framebuffer wrapper for fake dma-bufs
+ * Copyright (C) 2012 Red Hat
+ * Copyright (c) 2015 - 2020 DisplayLink (UK) Ltd.
+ * Copyright (c) 2025 Lindroid Authors
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License v2. See the file COPYING in the main directory of this archive for
+ * more details.
  */
 
 #include "evdi_drv.h"
@@ -189,14 +195,16 @@ struct drm_framebuffer *evdi_fb_user_fb_create(struct drm_device *dev,
 	efb->obj = bo;
 	efb->owner = file;
 	efb->active = true;
-	memfd_file = fget(mode_cmd->handles[0]);
-	if (memfd_file) {
-		bytes_read = kernel_read(memfd_file, &id, sizeof(id), &pos);
-		if (bytes_read == sizeof(id))
-			efb->gralloc_buf_id = id;
+	efb->gralloc_buf_id = evdi_fb_extract_gralloc_id(mode_cmd);
+	if (!efb->gralloc_buf_id) {
+		memfd_file = fget(mode_cmd->handles[0]);
+		if (memfd_file) {
+			bytes_read = kernel_read(memfd_file, &id, sizeof(id), &pos);
+			if (bytes_read == sizeof(id))
+				efb->gralloc_buf_id = id;
+			fput(memfd_file);
+		}
 	}
-	if (!efb->gralloc_buf_id)
-		efb->gralloc_buf_id = evdi_fb_extract_gralloc_id(mode_cmd);
 
 	ret = evdi_fb_init_core(dev, efb, mode_cmd);
 	if (ret) {
