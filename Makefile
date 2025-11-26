@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 VERSION = 6
 PATCHLEVEL = 1
-SUBLEVEL = 157
+SUBLEVEL = 158
 EXTRAVERSION =
 NAME = Curry Ramen
 
@@ -1307,6 +1307,7 @@ endif
 
 # ---------------------------------------------------------------------------
 # Devicetree files
+ifndef CONFIG_ARCH_MXR
 ifeq ($(KBUILD_EXTMOD),)
 ifneq ($(wildcard $(srctree)/arch/$(SRCARCH)/boot/dts/),)
 dtstree := arch/$(SRCARCH)/boot/dts
@@ -1359,6 +1360,7 @@ PHONY += dt_binding_check
 dt_binding_check: scripts_dtc
 	$(Q)$(MAKE) $(build)=Documentation/devicetree/bindings
 
+endif
 
 ifeq ($(KBUILD_EXTMOD),)
 

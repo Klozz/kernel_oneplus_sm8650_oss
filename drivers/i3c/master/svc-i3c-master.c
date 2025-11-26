@@ -448,7 +448,7 @@ static void svc_i3c_master_ibi_work(struct work_struct *work)
 	switch (ibitype) {
 	case SVC_I3C_MSTATUS_IBITYPE_IBI:
 		dev = svc_i3c_master_dev_from_addr(master, ibiaddr);
-		if (!dev)
+		if (!dev) {
 			svc_i3c_master_nack_ibi(master);
 		} else {
 			if (dev->info.bcr & I3C_BCR_IBI_PAYLOAD)

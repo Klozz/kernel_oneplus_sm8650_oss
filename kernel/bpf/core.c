@@ -365,18 +365,9 @@ static int bpf_adj_delta_to_imm(struct bpf_insn *insn, u32 pos, s32 end_old,
 static int bpf_adj_delta_to_off(struct bpf_insn *insn, u32 pos, s32 end_old,
 				s32 end_new, s32 curr, const bool probe_pass)
 {
-	s64 off_min, off_max, off;
+	const s32 off_min = S16_MIN, off_max = S16_MAX;
 	s32 delta = end_new - end_old;
-
-	if (insn->code == (BPF_JMP32 | BPF_JA)) {
-		off = insn->imm;
-		off_min = S32_MIN;
-		off_max = S32_MAX;
-	} else {
-		off = insn->off;
-		off_min = S16_MIN;
-		off_max = S16_MAX;
-	}
+	s32 off = insn->off;
 
 	if (curr < pos && curr + off + 1 >= end_old)
 		off += delta;
@@ -384,12 +375,8 @@ static int bpf_adj_delta_to_off(struct bpf_insn *insn, u32 pos, s32 end_old,
 		off -= delta;
 	if (off < off_min || off > off_max)
 		return -ERANGE;
-	if (!probe_pass) {
-		if (insn->code == (BPF_JMP32 | BPF_JA))
-			insn->imm = off;
-		else
-			insn->off = off;
-	}
+	if (!probe_pass)
+		insn->off = off;
 	return 0;
 }
 
@@ -1608,7 +1595,6 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
 	INSN_3(JMP, JSLE, K),			\
 	INSN_3(JMP, JSET, K),			\
 	INSN_2(JMP, JA),			\
-	INSN_2(JMP32, JA),			\
 	/* Store instructions. */		\
 	/*   Register based. */			\
 	INSN_3(STX, MEM,  B),			\
@@ -1885,9 +1871,6 @@ out:
 	JMP_JA:
 		insn += insn->off;
 		CONT;
-	JMP32_JA:
-		insn += insn->imm;
-		CONT;
 	JMP_EXIT:
 		return BPF_R0;
 	/* JMP */
@@ -2120,63 +2103,27 @@ bool bpf_prog_map_compatible(struct bpf_map *map,
 			     const struct bpf_prog *fp)
 {
 	enum bpf_prog_type prog_type = resolve_prog_type(fp);
-	struct bpf_prog_aux *aux = fp->aux;
-	enum bpf_cgroup_storage_type i;
-	bool ret = false;
-	u64 cookie;
+	bool ret;
 
 	if (fp->kprobe_override)
-		return ret;
+		return false;
 
-	spin_lock(&map->owner_lock);
-	/* There's no owner yet where we could check for compatibility. */
-	if (!map->owner) {
-		map->owner = bpf_map_owner_alloc(map);
-		if (!map->owner)
-			goto err;
-		map->owner->type  = prog_type;
-		map->owner->jited = fp->jited;
-		map->owner->xdp_has_frags = aux->xdp_has_frags;
-		map->owner->expected_attach_type = fp->expected_attach_type;
-		map->owner->attach_func_proto = aux->attach_func_proto;
-		for_each_cgroup_storage_type(i) {
-			map->owner->storage_cookie[i] =
-				aux->cgroup_storage[i] ?
-				aux->cgroup_storage[i]->cookie : 0;
-		}
+	spin_lock(&map->owner.lock);
+	if (!map->owner.type) {
+		/* There's no owner yet where we could check for
+		 * compatibility.
+		 */
+		map->owner.type  = prog_type;
+		map->owner.jited = fp->jited;
+		map->owner.xdp_has_frags = fp->aux->xdp_has_frags;
 		ret = true;
 	} else {
-		ret = map->owner->type  == prog_type &&
-		      map->owner->jited == fp->jited &&
-		      map->owner->xdp_has_frags == aux->xdp_has_frags;
-		if (ret &&
-		    map->map_type == BPF_MAP_TYPE_PROG_ARRAY &&
-		    map->owner->expected_attach_type != fp->expected_attach_type)
-			ret = false;
-		for_each_cgroup_storage_type(i) {
-			if (!ret)
-				break;
-			cookie = aux->cgroup_storage[i] ?
-				 aux->cgroup_storage[i]->cookie : 0;
-			ret = map->owner->storage_cookie[i] == cookie ||
-			      !cookie;
-		}
-		if (ret &&
-		    map->owner->attach_func_proto != aux->attach_func_proto) {
-			switch (prog_type) {
-			case BPF_PROG_TYPE_TRACING:
-			case BPF_PROG_TYPE_LSM:
-			case BPF_PROG_TYPE_EXT:
-			case BPF_PROG_TYPE_STRUCT_OPS:
-				ret = false;
-				break;
-			default:
-				break;
-			}
-		}
+		ret = map->owner.type  == prog_type &&
+		      map->owner.jited == fp->jited &&
+		      map->owner.xdp_has_frags == fp->aux->xdp_has_frags;
 	}
-err:
-	spin_unlock(&map->owner_lock);
+	spin_unlock(&map->owner.lock);
+
 	return ret;
 }
 

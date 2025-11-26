@@ -1,8 +1,9 @@
+// SPDX-License-Identifier:  GPL-2.0-only
 /*
  * MAX77720 voltage regulator Driver
  *
  * Copyright (c) 2024 Analog Devices, Inc.
- *
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  * MAX77720 PMIC Linux Driver is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as published by
@@ -16,7 +17,6 @@
  *
  * You should have received a copy of the GNU General Public License along with
  * MAX77720 PMIC Linux Driver. If not, see http://www.gnu.org/licenses/.
- * Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/i2c.h>
@@ -99,8 +99,8 @@
 #define MAX77720_MASK_GPIO_CFG			(0x07)
 #define MAX77720_MASK_VOUT			(0x7F)
 
-#define MAX77720_VOUT_MIN_UV			11000000
-#define MAX77720_VOUT_STEP_UV			20000
+#define MAX77720_VOUT_MIN_UV			17010000
+#define MAX77720_VOUT_STEP_UV			15000
 
 #define MAX77720_AD_DISABLE			0
 
@@ -363,11 +363,23 @@ static unsigned int max77720_get_mode(struct regulator_dev *rdev)
 	return ret;
 }
 
+static int max77720_enable(struct regulator_dev *rdev)
+{
+	int ret;
+	struct max77720_data *pdata = rdev_get_drvdata(rdev);
+
+	ret = regulator_enable_regmap(rdev);
+	if (ret < 0)
+		dev_dbg(pdata->dev, "[non-fatal] max77720 regulator enable failed\n");
+
+	return 0;
+}
+
 static const struct regulator_ops max77720_ibb_ops = {
 	.list_voltage = regulator_list_voltage_linear,
 	.get_voltage_sel = max77720_get_voltage_sel,
 	.set_voltage_sel = max77720_set_voltage_sel,
-	.enable = regulator_enable_regmap,
+	.enable = max77720_enable,
 	.disable = regulator_disable_regmap,
 	.is_enabled = regulator_is_enabled_regmap,
 	.get_status = max77720_get_status,
@@ -384,7 +396,7 @@ static const struct regulator_ops max77720_base_ibb_ops = {
 };
 
 static const struct regulator_desc max77720_low_regulators_desc = {
-	.name = "max77720",
+	.name = "max77720_tof",
 	.id = MAX77720_ID_VOUT,
 	.ops = &max77720_ibb_ops,
 	.type = REGULATOR_VOLTAGE,
@@ -458,6 +470,21 @@ static int max77720_init_regulator(struct max77720_data *pdata,
 		dev_err(pdata->dev, "MAX77720_SUB_C not supported %s\n", __func__);
 	break;
 	default:
+		dev_dbg(pdata->dev, "MAX77720_SUB_E function [%s] version: %d\n", __func__,
+			(rval & MAX77720_MASK_GPIO_CFG));
+		pdata->regulator_desc = max77720_low_regulators_desc;
+		config.init_data = of_get_regulator_init_data(pdata->dev,
+				pdata->dev->of_node,
+				&max77720_low_regulators_desc);
+		pdata->regulator
+			= devm_regulator_register(pdata->dev,
+				&max77720_low_regulators_desc, &config);
+#if IS_ENABLED(CONFIG_REGULATOR_DEBUG_CONTROL)
+		ret = devm_regulator_debug_register(pdata->dev, pdata->regulator);
+		if (ret)
+			dev_err(pdata->dev,
+				"failed to register debug regulator for bob rc=%d\n", ret);
+#endif
 		dev_err(pdata->dev, "MAX77720_default function %s\n", __func__);
 	break;
 	}
@@ -484,6 +511,7 @@ static int max77720_regulator_probe(struct i2c_client *client,
 	if (!pdata)
 		return -ENOMEM;
 
+	pdata_global = pdata;
 	i2c_set_clientdata(client, pdata);
 	pdata->dev = dev;
 
@@ -543,7 +571,6 @@ static int max77720_regulator_probe(struct i2c_client *client,
 		}
 	}
 
-	pdata_global = pdata;
 
 	return 0;
 
@@ -571,7 +598,7 @@ MODULE_DEVICE_TABLE(i2c, max77720_regulator_id);
 
 static struct i2c_driver max77720_regulator_driver = {
 	.driver = {
-		.name = "max77720",
+		.name = "max77720_tof",
 		.of_match_table = of_match_ptr(max77720_of_match),
 	},
 	.probe = max77720_regulator_probe,

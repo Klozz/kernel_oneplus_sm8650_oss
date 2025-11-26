@@ -35,7 +35,6 @@
 #include <linux/rcupdate_trace.h>
 #include <linux/memcontrol.h>
 #include <linux/trace_events.h>
-#include <linux/cookie.h>
 
 #include <trace/hooks/syscall_check.h>
 
@@ -50,7 +49,6 @@
 #define BPF_OBJ_FLAG_MASK   (BPF_F_RDONLY | BPF_F_WRONLY)
 
 DEFINE_PER_CPU(int, bpf_prog_active);
-DEFINE_COOKIE(bpf_map_cookie);
 static DEFINE_IDR(prog_idr);
 static DEFINE_SPINLOCK(prog_idr_lock);
 static DEFINE_IDR(map_idr);
@@ -633,7 +631,6 @@ static void bpf_map_free_deferred(struct work_struct *work)
 	security_bpf_map_free(map);
 	kfree(map->off_arr);
 	bpf_map_release_memcg(map);
-	bpf_map_owner_free(map);
 	/* implementation dependent freeing, map_free callback also does
 	 * bpf_map_free_kptr_off_tab, if needed.
 	 */
@@ -648,28 +645,6 @@ static void bpf_map_put_uref(struct bpf_map *map)
 	}
 }
 
-static void bpf_map_free_in_work(struct bpf_map *map)
-{
-	INIT_WORK(&map->work, bpf_map_free_deferred);
-	/* Avoid spawning kworkers, since they all might contend
-	 * for the same mutex like slab_mutex.
-	 */
-	queue_work(system_unbound_wq, &map->work);
-}
-
-static void bpf_map_free_rcu_gp(struct rcu_head *rcu)
-{
-	bpf_map_free_in_work(container_of(rcu, struct bpf_map, rcu));
-}
-
-static void bpf_map_free_mult_rcu_gp(struct rcu_head *rcu)
-{
-	if (rcu_trace_implies_rcu_gp())
-		bpf_map_free_rcu_gp(rcu);
-	else
-		call_rcu(rcu, bpf_map_free_rcu_gp);
-}
-
 /* decrement map refcnt and schedule it for freeing via workqueue
  * (unrelying map implementation ops->map_free() might sleep)
  */
@@ -679,11 +654,11 @@ static void __bpf_map_put(struct bpf_map *map, bool do_idr_lock)
 		/* bpf_map_free_id() must be called first */
 		bpf_map_free_id(map, do_idr_lock);
 		btf_put(map->btf);
-
-		if (READ_ONCE(map->free_after_mult_rcu_gp))
-			call_rcu_tasks_trace(&map->rcu, bpf_map_free_mult_rcu_gp);
-		else
-			bpf_map_free_in_work(map);
+		INIT_WORK(&map->work, bpf_map_free_deferred);
+		/* Avoid spawning kworkers, since they all might contend
+		 * for the same mutex like slab_mutex.
+		 */
+		queue_work(system_unbound_wq, &map->work);
 	}
 }
 
@@ -741,12 +716,12 @@ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
 	struct bpf_map *map = filp->private_data;
 	u32 type = 0, jited = 0;
 
-	spin_lock(&map->owner_lock);
-	if (map->owner) {
-		type  = map->owner->type;
-		jited = map->owner->jited;
+	if (map_type_contains_progs(map)) {
+		spin_lock(&map->owner.lock);
+		type  = map->owner.type;
+		jited = map->owner.jited;
+		spin_unlock(&map->owner.lock);
 	}
-	spin_unlock(&map->owner_lock);
 
 	seq_printf(m,
 		   "map_type:\t%u\n"
@@ -1157,14 +1132,10 @@ static int map_create(union bpf_attr *attr)
 	if (err < 0)
 		goto free_map;
 
-	preempt_disable();
-	map->cookie = gen_cookie_next(&bpf_map_cookie);
-	preempt_enable();
-
 	atomic64_set(&map->refcnt, 1);
 	atomic64_set(&map->usercnt, 1);
 	mutex_init(&map->freeze_mutex);
-	spin_lock_init(&map->owner_lock);
+	spin_lock_init(&map->owner.lock);
 
 	map->spin_lock_off = -EINVAL;
 	map->timer_off = -EINVAL;
@@ -1361,8 +1332,6 @@ static int map_lookup_elem(union bpf_attr *attr)
 	int ufd = attr->map_fd;
 	struct bpf_map *map;
 	void *key, *value;
-	u8 key_onstack[SZ_16] __aligned(sizeof(long));
-	u8 value_onstack[SZ_64] __aligned(sizeof(long));
 	u32 value_size;
 	struct fd f;
 	int err;
@@ -1388,30 +1357,18 @@ static int map_lookup_elem(union bpf_attr *attr)
 		goto err_put;
 	}
 
-	if (map->key_size && map->key_size <= sizeof(key_onstack)) {
-		key = key_onstack;
-		if (copy_from_user(key, ukey, map->key_size)) {
-			err = -EFAULT;
-			goto err_put;
-		}
-	} else {
-		key = __bpf_copy_key(ukey, map->key_size);
-		if (IS_ERR(key)) {
-			err = PTR_ERR(key);
-			goto err_put;
-		}
+	key = __bpf_copy_key(ukey, map->key_size);
+	if (IS_ERR(key)) {
+		err = PTR_ERR(key);
+		goto err_put;
 	}
 
 	value_size = bpf_map_value_size(map);
 
 	err = -ENOMEM;
-	if (value_size <= sizeof(value_onstack)) {
-		value = value_onstack;
-	} else {
-		value = kvmalloc(value_size, GFP_USER | __GFP_NOWARN);
-		if (!value)
-			goto free_key;
-	}
+	value = kvmalloc(value_size, GFP_USER | __GFP_NOWARN);
+	if (!value)
+		goto free_key;
 
 	if (map->map_type == BPF_MAP_TYPE_BLOOM_FILTER) {
 		if (copy_from_user(value, uvalue, value_size))
@@ -1432,11 +1389,9 @@ static int map_lookup_elem(union bpf_attr *attr)
 	err = 0;
 
 free_value:
-	if (value != value_onstack)
-		kvfree(value);
+	kvfree(value);
 free_key:
-	if (key != key_onstack)
-		kvfree(key);
+	kvfree(key);
 err_put:
 	fdput(f);
 	return err;
@@ -1452,8 +1407,6 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 	int ufd = attr->map_fd;
 	struct bpf_map *map;
 	void *key, *value;
-	u8 key_onstack[SZ_16] __aligned(sizeof(long));
-	u8 value_onstack[SZ_64] __aligned(sizeof(long));
 	u32 value_size;
 	struct fd f;
 	int err;
@@ -1477,42 +1430,24 @@ static int map_update_elem(union bpf_attr *attr, bpfptr_t uattr)
 		goto err_put;
 	}
 
-	if (map->key_size && map->key_size <= sizeof(key_onstack)) {
-		key = key_onstack;
-		if (copy_from_bpfptr(key, ukey, map->key_size)) {
-			err = -EFAULT;
-			goto err_put;
-		}
-	} else {
-		key = ___bpf_copy_key(ukey, map->key_size);
-		if (IS_ERR(key)) {
-			err = PTR_ERR(key);
-			goto err_put;
-		}
+	key = ___bpf_copy_key(ukey, map->key_size);
+	if (IS_ERR(key)) {
+		err = PTR_ERR(key);
+		goto err_put;
 	}
 
 	value_size = bpf_map_value_size(map);
-	if (value_size <= sizeof(value_onstack)) {
-		value = value_onstack;
-		if (copy_from_bpfptr(value, uvalue, value_size)) {
-			err = -EFAULT;
-			goto free_key;
-		}
-	} else {
-		value = kvmemdup_bpfptr(uvalue, value_size);
-		if (IS_ERR(value)) {
-			err = PTR_ERR(value);
-			goto free_key;
-		}
+	value = kvmemdup_bpfptr(uvalue, value_size);
+	if (IS_ERR(value)) {
+		err = PTR_ERR(value);
+		goto free_key;
 	}
 
 	err = bpf_map_update_value(map, f, key, value, attr->flags);
 
-	if (value != value_onstack)
-		kvfree(value);
+	kvfree(value);
 free_key:
-	if (key != key_onstack)
-		kvfree(key);
+	kvfree(key);
 err_put:
 	bpf_map_write_active_dec(map);
 	fdput(f);
@@ -1528,7 +1463,6 @@ static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
 	struct bpf_map *map;
 	struct fd f;
 	void *key;
-	u8 key_onstack[SZ_16] __aligned(sizeof(long));
 	int err;
 
 	if (CHECK_ATTR(BPF_MAP_DELETE_ELEM))
@@ -1544,18 +1478,10 @@ static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
 		goto err_put;
 	}
 
-	if (map->key_size && map->key_size <= sizeof(key_onstack)) {
-		key = key_onstack;
-		if (copy_from_bpfptr(key, ukey, map->key_size)) {
-			err = -EFAULT;
-			goto err_put;
-		}
-	} else {
-		key = ___bpf_copy_key(ukey, map->key_size);
-		if (IS_ERR(key)) {
-			err = PTR_ERR(key);
-			goto err_put;
-		}
+	key = ___bpf_copy_key(ukey, map->key_size);
+	if (IS_ERR(key)) {
+		err = PTR_ERR(key);
+		goto err_put;
 	}
 
 	if (bpf_map_is_dev_bound(map)) {
@@ -1575,8 +1501,7 @@ static int map_delete_elem(union bpf_attr *attr, bpfptr_t uattr)
 	bpf_enable_instrumentation();
 	maybe_wait_bpf_programs(map);
 out:
-	if (key != key_onstack)
-		kvfree(key);
+	kvfree(key);
 err_put:
 	bpf_map_write_active_dec(map);
 	fdput(f);
@@ -1593,8 +1518,6 @@ static int map_get_next_key(union bpf_attr *attr)
 	int ufd = attr->map_fd;
 	struct bpf_map *map;
 	void *key, *next_key;
-	u8 key_onstack[SZ_16] __aligned(sizeof(long));
-	u8 next_key_onstack[SZ_64] __aligned(sizeof(long));
 	struct fd f;
 	int err;
 
@@ -1611,31 +1534,19 @@ static int map_get_next_key(union bpf_attr *attr)
 	}
 
 	if (ukey) {
-		if (map->key_size && map->key_size <= sizeof(key_onstack)) {
-			key = key_onstack;
-			if (copy_from_user(key, ukey, map->key_size)) {
-				err = -EFAULT;
-				goto err_put;
-			}
-		} else {
-			key = __bpf_copy_key(ukey, map->key_size);
-			if (IS_ERR(key)) {
-				err = PTR_ERR(key);
-				goto err_put;
-			}
+		key = __bpf_copy_key(ukey, map->key_size);
+		if (IS_ERR(key)) {
+			err = PTR_ERR(key);
+			goto err_put;
 		}
 	} else {
 		key = NULL;
 	}
 
 	err = -ENOMEM;
-	if (map->key_size <= sizeof(next_key_onstack)) {
-		next_key = next_key_onstack;
-	} else {
-		next_key = kvmalloc(map->key_size, GFP_USER);
-		if (!next_key)
-			goto free_key;
-	}
+	next_key = kvmalloc(map->key_size, GFP_USER);
+	if (!next_key)
+		goto free_key;
 
 	if (bpf_map_is_dev_bound(map)) {
 		err = bpf_map_offload_get_next_key(map, key, next_key);
@@ -1656,11 +1567,9 @@ out:
 	err = 0;
 
 free_next_key:
-	if (next_key != next_key_onstack)
-		kvfree(next_key);
+	kvfree(next_key);
 free_key:
-	if (key != key_onstack)
-		kvfree(key);
+	kvfree(key);
 err_put:
 	fdput(f);
 	return err;
@@ -1890,8 +1799,6 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
 	int ufd = attr->map_fd;
 	struct bpf_map *map;
 	void *key, *value;
-	u8 key_onstack[SZ_16] __aligned(sizeof(long));
-	u8 value_onstack[SZ_64] __aligned(sizeof(long));
 	u32 value_size;
 	struct fd f;
 	int err;
@@ -1926,30 +1833,18 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
 		goto err_put;
 	}
 
-	if (map->key_size && map->key_size <= sizeof(key_onstack)) {
-		key = key_onstack;
-		if (copy_from_user(key, ukey, map->key_size)) {
-			err = -EFAULT;
-			goto err_put;
-		}
-	} else {
-		key = __bpf_copy_key(ukey, map->key_size);
-		if (IS_ERR(key)) {
-			err = PTR_ERR(key);
-			goto err_put;
-		}
+	key = __bpf_copy_key(ukey, map->key_size);
+	if (IS_ERR(key)) {
+		err = PTR_ERR(key);
+		goto err_put;
 	}
 
 	value_size = bpf_map_value_size(map);
 
-	if (value_size <= sizeof(value_onstack)) {
-		value = value_onstack;
-	} else {
-		err = -ENOMEM;
-		value = kvmalloc(value_size, GFP_USER | __GFP_NOWARN);
-		if (!value)
-			goto free_key;
-	}
+	err = -ENOMEM;
+	value = kvmalloc(value_size, GFP_USER | __GFP_NOWARN);
+	if (!value)
+		goto free_key;
 
 	err = -ENOTSUPP;
 	if (map->map_type == BPF_MAP_TYPE_QUEUE ||
@@ -1979,11 +1874,9 @@ static int map_lookup_and_delete_elem(union bpf_attr *attr)
 	err = 0;
 
 free_value:
-	if (value != value_onstack)
-		kvfree(value);
+	kvfree(value);
 free_key:
-	if (key != key_onstack)
-		kvfree(key);
+	kvfree(key);
 err_put:
 	bpf_map_write_active_dec(map);
 	fdput(f);
@@ -5349,8 +5242,7 @@ static const struct bpf_func_proto bpf_kallsyms_lookup_name_proto = {
 	.arg1_type	= ARG_PTR_TO_MEM,
 	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
 	.arg3_type	= ARG_ANYTHING,
-	.arg4_type	= ARG_PTR_TO_FIXED_SIZE_MEM | MEM_UNINIT | MEM_ALIGNED,
-	.arg4_size	= sizeof(u64),
+	.arg4_type	= ARG_PTR_TO_LONG,
 };
 
 static const struct bpf_func_proto *

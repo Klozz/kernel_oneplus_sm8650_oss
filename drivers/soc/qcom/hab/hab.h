@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #ifndef __HAB_H
 #define __HAB_H
@@ -26,6 +26,7 @@ enum hab_payload_type {
 	HAB_PAYLOAD_TYPE_IMPORT_ACK,
 	HAB_PAYLOAD_TYPE_IMPORT_ACK_FAIL,
 	HAB_PAYLOAD_TYPE_UNIMPORT,
+	HAB_PAYLOAD_TYPE_IMPORT_LOOPBACK_ACK,
 	HAB_PAYLOAD_TYPE_MAX,
 };
 #define LOOPBACK_DOM 0xFF
@@ -66,7 +67,13 @@ enum hab_payload_type {
 #define DEVICE_XVM3_NAME "hab_xvm3"
 #define DEVICE_VNW1_NAME "hab_vnw1"
 #define DEVICE_EXT1_NAME "hab_ext1"
+#define DEVICE_EXT2_NAME "hab_ext2"
+#define DEVICE_EXT3_NAME "hab_ext3"
 #define DEVICE_GPCE1_NAME "hab_gpce1"
+#define DEVICE_SOCCP1_NAME "hab_soccp1"
+#define DEVICE_DPRX1_NAME "hab_dprx1"
+#define DEVICE_DPRX2_NAME "hab_dprx2"
+#define DEVICE_EVA1_NAME "hab_eva1"
 
 #define HABCFG_MMID_NUM        26
 #define HAB_MMID_ALL_AREA      0
@@ -304,6 +311,20 @@ struct hab_device {
 	int openq_cnt;
 };
 
+struct virq_uhab_context {
+	struct list_head node; /* managed by the driver */
+	struct kref refcount;
+
+	/* keeps track of virq setup per context */
+	struct list_head virq;
+	int virq_total;
+
+	rwlock_t ctx_lock;
+
+	int kernel;
+	int owner;
+};
+
 struct uhab_context {
 	struct list_head node; /* managed by the driver */
 	struct kref refcount;
@@ -377,9 +398,13 @@ struct hab_driver {
 	int ndevices;
 	struct hab_device *devp;
 	struct uhab_context *kctx;
+	struct virq_uhab_context *kvirq_ctx;
 
 	struct list_head uctx_list;
 	int ctx_cnt;
+	struct list_head virq_uctx_list;
+	int virq_ctx_cnt;
+
 	spinlock_t drvlock;
 
 	struct list_head imp_list;
@@ -512,6 +537,7 @@ struct export_desc_super {
 	void *platform_data;
 	unsigned long offset;
 	unsigned int payload_size; /* size of the compressed pfn structure */
+	bool is_loopback;
 
 	enum exp_desc_state import_state;
 	enum export_state exp_state;
@@ -585,6 +611,7 @@ int habmem_hyp_grant(struct virtual_channel *vchan,
 		int *compressed_size,
 		int *export_id);
 
+void habmem_defer_unimp_sent(struct export_desc *export);
 int habmem_hyp_revoke(void *expdata, uint32_t count);
 int habmem_exp_release(struct export_desc_super *exp_super);
 
@@ -594,7 +621,7 @@ void habmem_imp_hyp_close(void *priv, int kernel);
 int habmem_imp_hyp_map(void *imp_ctx, struct hab_import *param,
 		struct export_desc *exp, int kernel);
 
-int habmm_imp_hyp_unmap(void *imp_ctx, struct export_desc *exp, int kernel);
+int habmm_imp_hyp_unmap(void *imp_ctx, struct export_desc *exp, long fcnt_idle);
 
 int habmem_imp_hyp_mmap(struct file *flip, struct vm_area_struct *vma);
 
@@ -725,6 +752,7 @@ int hab_stat_show_vchan(struct hab_driver *drv, char *buf, int sz);
 int hab_stat_show_ctx(struct hab_driver *drv, char *buf, int sz);
 int hab_stat_show_expimp(struct hab_driver *drv, int pid, char *buf, int sz);
 int hab_stat_show_reclaim(struct hab_driver *drv, char *buf, int sz);
+int hab_stat_show_virq(struct hab_driver *drv, char *buf, int sz);
 int hab_stat_init_sub(struct hab_driver *drv);
 int hab_stat_deinit_sub(struct hab_driver *drv);
 

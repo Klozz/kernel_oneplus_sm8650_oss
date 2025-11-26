@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/bitmap.h>
@@ -33,12 +33,20 @@
 #include <linux/tty_flip.h>
 #include <uapi/linux/msm_geni_serial.h>
 #include <linux/bootmarker_kernel.h>
+#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+#include <linux/pogo_common.h>
+#endif
 
 static bool con_enabled = IS_ENABLED(CONFIG_SERIAL_MSM_GENI_CONSOLE_DEFAULT_ENABLED);
 
 /* UART specific GENI registers */
+#define GENI_CFG_STATUS			(0x88)
+#define SE_GENI_CFG_REG64		(0x200)
+#define SE_GENI_CFG_REG67		(0x20C)
 #define SE_UART_LOOPBACK_CFG		(0x22C)
+#define SE_GENI_CFG_REG76		(0x230)
 #define SE_GENI_CFG_REG80		(0x240)
+#define SE_GENI_CFG_REG81		(0x244)
 #define SE_UART_TX_TRANS_CFG		(0x25C)
 #define SE_UART_TX_WORD_LEN		(0x268)
 #define SE_UART_TX_STOP_BIT_LEN		(0x26C)
@@ -57,11 +65,53 @@ static bool con_enabled = IS_ENABLED(CONFIG_SERIAL_MSM_GENI_CONSOLE_DEFAULT_ENAB
 #define M_FW_ERR_STATUS			(0x628)
 #define M_GP_LENGTH			(0x910)
 #define S_GP_LENGTH			(0x914)
+#define SE_HW_PARAM_2			(0xE2C)
 #define SE_DMA_DEBUG_REG0		(0xE40)
 #define SE_DMA_IF_EN			(0x004)
 #define SE_GENI_GENERAL_CFG		(0x10)
 #define SE_DMA_TX_MAX_BURST		(0xC5C)
 #define SE_DMA_RX_MAX_BURST		(0xD5C)
+
+/* SE_GENI_CFG_REG64 */
+#define UART_SINGLE_WIRE_EN			BIT(18)
+
+/* SE_HW_PARAM_2 */
+#define UART_SINGLE_WIRE_SUPPORTED		BIT(19)
+
+/* SE_UART_IO_MACRO_CTRL */
+#define UART_IO_MACRO_IO2_SEL_MASK		GENMASK(5, 4)
+#define UART_IO_MACRO_IO2_SEL_SHIFT		(0x4)
+#define UART_IO_MACRO_IO3_SEL_MASK		GENMASK(7, 6)
+#define UART_IO_MACRO_IO3_SEL_SHIFT		(0x6)
+#define UART_IO_MACRO_RX_DATA_IN_SEL_MASK	GENMASK(9, 8)
+#define UART_IO_MACRO_RX_DATA_IN_SEL_SHIFT	(0x8)
+
+/* SE_GENI_CFG_SEQ_START */
+#define UART_START_TRIGGER			BIT(0)
+
+/* SE_GENI_CFG_STATUS */
+#define UART_CFG_SEQ_DONE			BIT(1)
+
+/* SE_GENI_CFG_REG87 */
+#define M_SW_COMP3				BIT(3)
+
+/* SE_GENI_CFG_REG81 */
+#define GENI_SOUT0_PULL_UP_EN			BIT(0)
+
+/* SE_GENI_CFG_REG76 */
+#define TX_ENGINE_INV_EN			BIT(0)
+
+/* SE_GENI_CFG_REG67 */
+#define TX_DEFAULT_SOUT_VALUE			BIT(13)
+#define TX_DEFAULT_SOE_VALUE			BIT(14)
+
+/* UART mode */
+#define OPEN_DRAIN_MODE		(0)
+#define PUSH_PULL_MODE		(0x1)
+
+/* UART QUP Lane type */
+#define QUP_L2_LANE	(0x2)
+#define QUP_L3_LANE	(0x3)
 
 /* SE_UART_LOOPBACK_CFG */
 #define NO_LOOPBACK		(0)
@@ -209,6 +259,24 @@ static bool con_enabled = IS_ENABLED(CONFIG_SERIAL_MSM_GENI_CONSOLE_DEFAULT_ENAB
 
 #define BOOT_MARKER_SIZE	50
 
+#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+static struct pogo_keyboard_operations pogo_keyboard_ops = {
+	.name = "pogo_keyboard_ops",
+	.init = NULL,
+	.write = NULL,
+	.recv = NULL,
+	.resume = NULL,
+	.suspend = NULL,
+	.remove = NULL,
+	.check = NULL,
+};
+struct pogo_keyboard_operations *get_pogo_keyboard_operations(void)
+{
+	return &pogo_keyboard_ops;
+}
+EXPORT_SYMBOL_GPL(get_pogo_keyboard_operations);
+#endif
+
 /* FTRACE Logging */
 static void __ftrace_dbg(struct device *dev, const char *fmt, ...)
 {
@@ -265,6 +333,7 @@ static void __ftrace_dbg(struct device *dev, const char *fmt, ...)
  * @UART_ERROR_FLOW_OFF: used to indicate when UART is not ready to
  *  receive data and flow is turned off
  * @UART_ERROR_RX_FRAMING_ERR: used when Rx framing error encountered
+ * @UART_ERROR_CONTENTION: used when contention encountered on one wire uart bus
  */
 enum uart_error_code {
 	UART_ERROR_DEFAULT = 0,
@@ -290,6 +359,7 @@ enum uart_error_code {
 	SOC_ERROR_START_TX_IOS_SOC_RFR_HIGH = 20,
 	UART_ERROR_FLOW_OFF = 21,
 	UART_ERROR_RX_FRAMING_ERR = 22,
+	UART_ERROR_CONTENTION = 23,
 
 	/* keep last */
 	UART_ERROR_CODE_MAX,
@@ -372,6 +442,22 @@ struct uart_gsi {
 	struct dma_async_tx_descriptor *rx_desc;
 	struct msm_gpi_dma_async_tx_cb_param tx_cb;
 	struct msm_gpi_dma_async_tx_cb_param rx_cb;
+};
+
+/*
+ * struct one_wire_uart_config: This struct holds configuration details for the one-wire UART.
+ *
+ * @error: specifies if any one-wire UART errors have occurred
+ * @qup_lane: specifies whether the lane used is L2 or L3
+ * @output_mode: specifies the UART mode is open-drain or push-pull
+ * @enable: specifies whether one-wire UART is enabled or not
+ *
+ */
+struct one_wire_uart_config {
+	int error;
+	u32 qup_lane;
+	bool output_mode;
+	bool enable;
 };
 
 struct msm_geni_serial_port {
@@ -466,6 +552,7 @@ struct msm_geni_serial_port {
 	 * when runtime suspend was in progress
 	 */
 	struct mutex suspend_resume_lock;
+	struct one_wire_uart_config one_wire_uart;
 };
 
 static const struct uart_ops msm_geni_serial_pops;
@@ -745,11 +832,17 @@ int msm_geni_serial_resources_off(struct msm_geni_serial_port *port)
 		return ret;
 	}
 
-	ret = pinctrl_select_state(rsc->geni_pinctrl, rsc->geni_gpio_sleep);
-	if (ret) {
-		UART_LOG_DBG(port->ipc_log_misc, port->uport.dev,
-			"%s: Error %d pinctrl_select_state failed\n", __func__, ret);
-		return ret;
+	if (!IS_ERR_OR_NULL(port->serial_rsc.geni_gpio_shutdown) &&
+	    port->port_state == UART_PORT_CLOSED_SHUTDOWN) {
+		ret = pinctrl_select_state(rsc->geni_pinctrl, rsc->geni_gpio_shutdown);
+		if (ret)
+			UART_LOG_DBG(port->ipc_log_misc, port->uport.dev,
+				     "%s: Error %d pinctrl shutdown state failed\n", __func__, ret);
+	} else {
+		ret = pinctrl_select_state(rsc->geni_pinctrl, rsc->geni_gpio_sleep);
+		if (ret)
+			UART_LOG_DBG(port->ipc_log_misc, port->uport.dev,
+				     "%s: Error %d pinctrl sleep failed\n", __func__, ret);
 	}
 	return ret;
 }
@@ -828,10 +921,18 @@ static void msm_geni_serial_enable_interrupts(struct uart_port *uport)
 	geni_m_irq_en |= M_IRQ_BITS;
 	geni_s_irq_en |= S_IRQ_BITS;
 
-	/* Enable Rx Frame error & Rx Break error, CTS interrupts only if Port is in open state */
+	/*
+	 * Enable Rx Frame error & Rx Break error, Contention IRQ for one-wire UART,
+	 * CTS interrupts only if Port is in open state.
+	 */
 	if (uport->state && uport->state->port.tty) {
 		geni_m_irq_en |= (M_IO_DATA_DEASSERT_EN | M_IO_DATA_ASSERT_EN);
 		geni_s_irq_en |= (S_GP_IRQ_1_EN | S_GP_IRQ_2_EN | S_GP_IRQ_3_EN);
+		if (port->one_wire_uart.enable &&
+		    port->one_wire_uart.output_mode == OPEN_DRAIN_MODE) {
+			geni_m_irq_en |= M_GP_IRQ_0_EN;
+			port->one_wire_uart.error = 0;
+		}
 	} else {
 		geni_m_irq_en &= ~(M_IO_DATA_DEASSERT_EN | M_IO_DATA_ASSERT_EN |
 				   M_RX_FIFO_LAST_EN);
@@ -891,8 +992,13 @@ static bool msm_serial_try_disable_interrupts(struct uart_port *uport)
 	geni_m_irq_en &= ~M_IRQ_BITS;
 	geni_s_irq_en &= ~S_IRQ_BITS;
 
+	if (port->one_wire_uart.enable &&
+	    port->one_wire_uart.output_mode == OPEN_DRAIN_MODE)
+		geni_m_irq_en &= ~M_GP_IRQ_0_EN;
+
 	geni_write_reg(geni_m_irq_en, uport->membase, SE_GENI_M_IRQ_EN);
 	geni_write_reg(geni_s_irq_en, uport->membase, SE_GENI_S_IRQ_EN);
+
 	if (port->xfer_mode == GENI_SE_DMA) {
 		geni_write_reg(DMA_TX_IRQ_BITS, uport->membase,
 							SE_DMA_TX_IRQ_EN_CLR);
@@ -2447,6 +2553,14 @@ static int msm_geni_serial_prep_dma_tx(struct uart_port *uport)
 	if (!xmit_size)
 		return -EPERM;
 
+#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+	if(pogo_keyboard_ops.check && pogo_keyboard_ops.write) {
+		if(pogo_keyboard_ops.check(uport)) {
+			pogo_keyboard_ops.write(NULL,1);
+		}
+	}
+#endif
+
 	dump_ipc(uport, msm_port->ipc_log_tx, "DMA Tx",
 		 (char *)&xmit->buf[xmit->tail], 0, xmit_size);
 	UART_LOG_DBG(msm_port->ipc_log_misc, uport->dev,
@@ -3462,6 +3576,14 @@ static int msm_geni_serial_handle_dma_rx(struct uart_port *uport, bool drop_rx)
 		}
 	}
 
+#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+	if(pogo_keyboard_ops.check && pogo_keyboard_ops.recv){
+		if(pogo_keyboard_ops.check(uport)) {
+			pogo_keyboard_ops.recv((unsigned char *)(msm_port->rx_buf), rx_bytes);
+		}
+	}
+#endif
+
 	tport = &uport->state->port;
 	ret = tty_insert_flip_string(tport, (unsigned char *)(msm_port->rx_buf), rx_bytes);
 	rx_bytes_copied = ret;
@@ -3668,6 +3790,13 @@ static bool handle_tx_dma_xfer(u32 m_irq_status, struct uart_port *uport)
 				/* Reset SOC_RFR_HIGH error code if DMA TX is success */
 				msm_geni_update_uart_error_code(msm_port, UART_ERROR_DEFAULT);
 			}
+		#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+			if(pogo_keyboard_ops.check && pogo_keyboard_ops.write) {
+					if(pogo_keyboard_ops.check(uport)) {
+						pogo_keyboard_ops.write(NULL, 0);
+				}
+			}
+		#endif
 		}
 	}
 	if (m_irq_status & (M_CMD_CANCEL_EN | M_CMD_ABORT_EN))
@@ -3842,6 +3971,12 @@ static void msm_geni_serial_handle_isr(struct uart_port *uport,
 						SE_GENI_M_IRQ_CLEAR);
 	geni_write_reg(s_irq_status, uport->membase,
 						SE_GENI_S_IRQ_CLEAR);
+	if (msm_port->one_wire_uart.enable &&
+	    msm_port->one_wire_uart.output_mode == OPEN_DRAIN_MODE) {
+		if (m_irq_status & M_GP_IRQ_0_EN)
+			msm_port->one_wire_uart.error = UART_ERROR_CONTENTION;
+	}
+
 	if ((m_irq_status & M_ILLEGAL_CMD_EN)) {
 		if (uart_console(uport))
 			IPC_LOG_MSG(msm_port->console_log,
@@ -4078,6 +4213,14 @@ static void msm_geni_serial_shutdown(struct uart_port *uport)
 	int ret = 0, j = 0, i, timeout;
 	unsigned long long start_time;
 
+#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+	if(pogo_keyboard_ops.check && pogo_keyboard_ops.init){
+		if(pogo_keyboard_ops.check(uport)) {
+			pogo_keyboard_ops.init(uport,0);
+		}
+	}
+#endif
+
 	UART_LOG_DBG(msm_port->ipc_log_misc, uport->dev, "%s: %d\n", __func__, true);
 	msm_port->port_state = UART_PORT_SHUTDOWN_IN_PROGRESS;
 
@@ -4217,6 +4360,105 @@ static void msm_geni_serial_shutdown(struct uart_port *uport)
 	UART_LOG_DBG(msm_port->ipc_log_misc, uport->dev, "%s: End %d\n", __func__, ret);
 }
 
+/*
+ * msm_geni_one_wire_uart_config() - Config the SE in one wire UART mode.
+ *
+ * @uport: pointer to uart port
+ *
+ * Return: 0 on suceess or negative error code upon failure.
+ */
+static int msm_geni_one_wire_uart_config(struct uart_port *uport)
+{
+	u32 uart_io_macro_reg = 0, geni_cfg_reg64 = 0, geni_cfg_reg67 = 0;
+	u32 geni_cfg_reg76 = 0, geni_cfg_reg81 = 0, geni_cfg_reg87 = 0;
+	u32 geni_cfg_seq_start = 0, geni_cfg_status = 0;
+	u32 tx_trans_cfg = 0, iter = 0;
+	struct msm_geni_serial_port *msm_port = GET_DEV_PORT(uport);
+
+	uart_io_macro_reg = geni_read_reg(uport->membase, SE_UART_IO_MACRO_CTRL);
+
+	if (msm_port->one_wire_uart.qup_lane == QUP_L3_LANE) {
+		uart_io_macro_reg &= ~(UART_IO_MACRO_IO2_SEL_MASK);
+		uart_io_macro_reg |= 0x1 << UART_IO_MACRO_IO3_SEL_SHIFT;
+	} else {
+		/* Use the lane2 for one wire UART communication */
+		uart_io_macro_reg &= ~(UART_IO_MACRO_RX_DATA_IN_SEL_MASK);
+		uart_io_macro_reg |= 0x2 << UART_IO_MACRO_RX_DATA_IN_SEL_SHIFT;
+	}
+
+	geni_write_reg(uart_io_macro_reg, uport->membase, SE_UART_IO_MACRO_CTRL);
+
+	if (msm_port->one_wire_uart.output_mode == OPEN_DRAIN_MODE) {
+		geni_cfg_reg67 = geni_read_reg(uport->membase, SE_GENI_CFG_REG67);
+		geni_cfg_reg67 &= ~TX_DEFAULT_SOE_VALUE;
+		geni_write_reg(geni_cfg_reg67, uport->membase, SE_GENI_CFG_REG67);
+		/* Ensure that above register writes went through */
+		geni_read_reg(uport->membase, SE_GENI_CFG_REG67);
+		geni_cfg_reg67 &= ~TX_DEFAULT_SOUT_VALUE;
+		geni_write_reg(geni_cfg_reg67, uport->membase, SE_GENI_CFG_REG67);
+		geni_write_reg(0x1, uport->membase, GENI_FORCE_DEFAULT_REG);
+	}
+
+	geni_cfg_reg64 = geni_read_reg(uport->membase, SE_GENI_CFG_REG64);
+	geni_cfg_reg64 |= UART_SINGLE_WIRE_EN;
+	geni_write_reg(geni_cfg_reg64, uport->membase, SE_GENI_CFG_REG64);
+
+	tx_trans_cfg = geni_read_reg(uport->membase, SE_UART_TX_TRANS_CFG);
+	tx_trans_cfg |= UART_CTS_MASK;
+	geni_write_reg(tx_trans_cfg, uport->membase, SE_UART_TX_TRANS_CFG);
+
+	if (msm_port->one_wire_uart.output_mode == OPEN_DRAIN_MODE) {
+		geni_cfg_reg76 = geni_read_reg(uport->membase, SE_GENI_CFG_REG76);
+		geni_cfg_reg76 |= TX_ENGINE_INV_EN;
+		geni_write_reg(geni_cfg_reg76, uport->membase, SE_GENI_CFG_REG76);
+
+		geni_cfg_reg81 = geni_read_reg(uport->membase, SE_GENI_CFG_REG81);
+		geni_cfg_reg81 |= GENI_SOUT0_PULL_UP_EN;
+		geni_write_reg(geni_cfg_reg81, uport->membase, SE_GENI_CFG_REG81);
+
+		geni_cfg_reg87 = geni_read_reg(uport->membase, SE_UART_TX_TRANS_CFG);
+		geni_cfg_reg87 |= M_SW_COMP3;
+		geni_write_reg(geni_cfg_reg87, uport->membase, SE_UART_TX_TRANS_CFG);
+	}
+
+	geni_cfg_seq_start = geni_read_reg(uport->membase, SE_GENI_CFG_SEQ_START);
+	geni_cfg_seq_start |= UART_START_TRIGGER;
+	geni_write_reg(geni_cfg_seq_start, uport->membase, SE_GENI_CFG_SEQ_START);
+
+	geni_cfg_status = geni_read_reg(uport->membase, GENI_CFG_STATUS);
+
+	/* Poll for UART CFG SEQ Done */
+	while (iter < POLL_ITERATIONS) {
+		geni_cfg_status = geni_read_reg(uport->membase, GENI_CFG_STATUS);
+		if (geni_cfg_status & UART_CFG_SEQ_DONE)
+			break;
+		usleep_range(10, 20);
+		iter++;
+	}
+
+	if (iter >= POLL_ITERATIONS) {
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "%s: uart_io_macro_reg:0x%x\n", __func__, uart_io_macro_reg);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_reg64:0x%x\n", geni_cfg_reg64);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_reg67:0x%x\n", geni_cfg_reg67);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_reg76:0x%x\n", geni_cfg_reg76);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_reg81:0x%x\n", geni_cfg_reg81);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_reg87:0x%x\n", geni_cfg_reg87);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_seq_start: 0x%x\n", geni_cfg_seq_start);
+		UART_LOG_DBG(msm_port->ipc_log_misc, msm_port->uport.dev,
+			     "geni_cfg_status: 0x%x\n", geni_cfg_status);
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
 static int msm_geni_serial_port_setup(struct uart_port *uport)
 {
 	int ret = 0;
@@ -4229,6 +4471,7 @@ static int msm_geni_serial_port_setup(struct uart_port *uport)
 					     __func__, msm_port->uart_kpi);
 	set_rfr_wm(msm_port);
 	geni_write_reg(rxstale, uport->membase, SE_UART_RX_STALE_CNT);
+
 	if (msm_port->gsi_mode) {
 		msm_port->xfer_mode = GENI_GPI_DMA;
 	} else if (!uart_console(uport)) {
@@ -4265,6 +4508,12 @@ static int msm_geni_serial_port_setup(struct uart_port *uport)
 		msm_geni_serial_enable_interrupts(uport);
 		geni_se_config_packing(&msm_port->se, 8, 1, false, true, false);
 		geni_se_config_packing(&msm_port->se, 8, 4, false, false, true);
+	}
+
+	if (msm_port->one_wire_uart.enable) {
+		ret = msm_geni_one_wire_uart_config(uport);
+		if (ret)
+			goto exit_portsetup;
 	}
 
 	geni_se_init(&msm_port->se, msm_port->rx_wm, msm_port->rx_rfr);
@@ -4338,6 +4587,14 @@ exit_startup:
 	if (likely(!uart_console(uport)))
 		msm_geni_serial_power_off(&msm_port->uport);
 	UART_LOG_DBG(msm_port->ipc_log_misc, uport->dev, "%s: ret:%d\n", __func__, ret);
+
+#ifdef CONFIG_OPLUS_POGOPIN_FUNCTION
+	if(pogo_keyboard_ops.check && pogo_keyboard_ops.init){
+		if(pogo_keyboard_ops.check(uport)) {
+			pogo_keyboard_ops.init(uport,1);
+		}
+	}
+#endif
 
 	return ret;
 }
@@ -4759,6 +5016,30 @@ static ssize_t xfer_mode_store(struct device *dev,
 
 static DEVICE_ATTR_RW(xfer_mode);
 
+/**
+ * one_wire_uart_error_show - Show the one-wire UART error value
+ * @dev: The device associated with the platform device
+ * @attr: The device attribute
+ * @buf: Buffer to store the error value
+ *
+ * Return: The number of characters written to the buffer
+ */
+
+static ssize_t one_wire_uart_error_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct msm_geni_serial_port *port = platform_get_drvdata(pdev);
+	int ret;
+
+	ret = scnprintf(buf, sizeof(int), "%d\n", port->one_wire_uart.error);
+	port->one_wire_uart.error = 0;
+
+	return ret;
+}
+
+static DEVICE_ATTR_RO(one_wire_uart_error);
+
 static ssize_t ver_info_show(struct device *dev,
 			struct device_attribute *attr, char *buf)
 {
@@ -5033,6 +5314,8 @@ static const struct of_device_id msm_geni_device_tbl[] = {
 #endif
 	{ .compatible = "qcom,msm-geni-serial-hs",
 			.data = (void *)&msm_geni_serial_hs_driver},
+	{ .compatible = "qcom,msm-geni-one-wire-serial",
+			.data = (void *)&msm_geni_serial_hs_driver},
 	{},
 };
 
@@ -5067,6 +5350,7 @@ static int msm_geni_serial_get_ver_info(struct uart_port *uport)
 	int len = (sizeof(struct msm_geni_serial_ver_info) * 2);
 	char fwver[20];
 	int invalid_fw_err = 0;
+	u32 se_hw_param2 = 0;
 
 	/* clks_on/off only for HSUART, as console remains actve */
 	if (!msm_port->is_console) {
@@ -5094,6 +5378,16 @@ static int msm_geni_serial_get_ver_info(struct uart_port *uport)
 	}
 
 	/* Basic HW and FW info */
+	if (msm_port->one_wire_uart.enable) {
+		se_hw_param2 = geni_read_reg(uport->membase, SE_HW_PARAM_2);
+		if (!(se_hw_param2 & UART_SINGLE_WIRE_SUPPORTED)) {
+			dev_err(uport->dev, "%s: SE doesn't support one wire uart mode\n",
+				__func__);
+			invalid_fw_err = -EINVAL;
+			goto exit_ver_info;
+		}
+	}
+
 	if (unlikely(geni_se_common_get_proto(uport->membase) != GENI_SE_UART)) {
 		dev_err(uport->dev, "%s: Invalid FW %d loaded.\n",
 			 __func__, geni_se_common_get_proto(uport->membase));
@@ -5268,6 +5562,35 @@ static int msm_geni_serial_get_clk(struct platform_device *pdev,
 
 	return ret;
 }
+
+/*
+ * msm_geni_one_wire_serial_read_dtsi() - Read one wire uart dt properties
+ *
+ * @pdev: pointer to the platform device
+ * @dev_port: pointer to the msm geni serial port
+ *
+ * Return: None
+ */
+static void msm_geni_one_wire_serial_read_dtsi(struct platform_device *pdev,
+					       struct msm_geni_serial_port *dev_port)
+{
+	if (of_device_is_compatible(pdev->dev.of_node, "qcom,msm-geni-one-wire-serial")) {
+		dev_port->one_wire_uart.enable = true;
+		/* Set default Lane as L2 */
+		dev_port->one_wire_uart.qup_lane = QUP_L2_LANE;
+		if (!of_property_read_u32(pdev->dev.of_node, "qcom,qup-lane",
+					  &dev_port->one_wire_uart.qup_lane)) {
+			if (dev_port->one_wire_uart.qup_lane != QUP_L2_LANE &&
+			    dev_port->one_wire_uart.qup_lane != QUP_L3_LANE)
+				dev_port->one_wire_uart.qup_lane = QUP_L2_LANE;
+		}
+		dev_info(&pdev->dev, "Lane:0x%x used for one wire uart usecase\n",
+			 dev_port->one_wire_uart.qup_lane);
+		dev_port->one_wire_uart.output_mode =
+			of_property_read_bool(pdev->dev.of_node, "qcom,push-pull");
+	}
+}
+
 static int msm_geni_serial_read_dtsi(struct platform_device *pdev,
 					struct msm_geni_serial_port *dev_port)
 {
@@ -5299,6 +5622,8 @@ static int msm_geni_serial_read_dtsi(struct platform_device *pdev,
 		dev_err(&pdev->dev, "Err getting SE Core clk %d\n", ret);
 		return ret;
 	}
+
+	msm_geni_one_wire_serial_read_dtsi(pdev, dev_port);
 
 	if (!is_console)
 		ret = geni_se_common_rsc_init(&dev_port->rsc, UART_CORE2X_VOTE,
@@ -5522,6 +5847,7 @@ static int msm_geni_serial_port_init(struct platform_device *pdev,
 	device_create_file(uport->dev, &dev_attr_capture_kpi);
 	device_create_file(uport->dev, &dev_attr_hs_uart_operation);
 	device_create_file(uport->dev, &dev_attr_hs_uart_version);
+	device_create_file(uport->dev, &dev_attr_one_wire_uart_error);
 
 	return 0;
 }
@@ -5727,6 +6053,7 @@ static int msm_geni_serial_remove(struct platform_device *pdev)
 	device_remove_file(port->uport.dev, &dev_attr_capture_kpi);
 	device_remove_file(port->uport.dev, &dev_attr_hs_uart_version);
 	device_remove_file(port->uport.dev, &dev_attr_hs_uart_operation);
+	device_remove_file(port->uport.dev, &dev_attr_one_wire_uart_error);
 	debugfs_remove(port->dbg);
 
 	dev_info(&pdev->dev, "%s driver removed %d\n", __func__, true);

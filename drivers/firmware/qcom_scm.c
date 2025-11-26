@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2010,2015,2019,2021 The Linux Foundation. All rights reserved.
  * Copyright (C) 2015 Linaro Ltd.
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #define pr_fmt(fmt)     "qcom-scm: %s: " fmt, __func__
 
@@ -2440,6 +2440,18 @@ int qcom_scm_config_set_ice_key(uint32_t index, phys_addr_t paddr, size_t size,
 }
 EXPORT_SYMBOL(qcom_scm_config_set_ice_key);
 
+int qcom_scm_hibernate_exit(void)
+{
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_ES,
+		.cmd = QCOM_SCM_ES_HIBERNATE_EXIT,
+		.owner = ARM_SMCCC_OWNER_SIP,
+	};
+
+	return qcom_scm_call_noretry(__scm->dev, &desc, NULL);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_hibernate_exit);
+
 int qcom_scm_clear_ice_key(uint32_t index,  unsigned int ce)
 {
 	struct qcom_scm_desc desc = {
@@ -3288,6 +3300,28 @@ int qcom_scm_invoke_callback_response(phys_addr_t out_buf,
 	return ret;
 }
 EXPORT_SYMBOL(qcom_scm_invoke_callback_response);
+
+int qcom_scm_invoke_ack_doorbell(u32 doorbell_id, u32 msg_id)
+{
+	int ret;
+	struct qcom_scm_desc desc = {
+		.svc = QCOM_SCM_SVC_SMCINVOKE,
+		.cmd = QCOM_SCM_SMCINVOKE_DOORBELL_ACK,
+		.owner = ARM_SMCCC_OWNER_TRUSTED_OS,
+		.args[0] = doorbell_id,
+		.args[1] = msg_id,
+		.arginfo = QCOM_SCM_ARGS(2),
+		.multicall_allowed = true,
+	};
+	struct qcom_scm_res res;
+
+	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	if (ret)
+		return ret;
+
+	return res.result[0];
+}
+EXPORT_SYMBOL_GPL(qcom_scm_invoke_ack_doorbell);
 
 int qcom_scm_qseecom_call(u32 cmd_id, struct qseecom_scm_desc *desc, bool retry)
 {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/clk-provider.h>
@@ -76,7 +76,7 @@ static struct clk_alpha_pll lsr_cc_pll0 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
-				[VDD_LOW] = 1600000000,
+				[VDD_LOWER_D1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
 				[VDD_HIGH] = 2500000000},
 		},
@@ -115,7 +115,7 @@ static struct clk_alpha_pll lsr_cc_pll1 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
-				[VDD_LOW] = 1600000000,
+				[VDD_LOWER_D1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
 				[VDD_HIGH] = 2500000000},
 		},
@@ -479,6 +479,7 @@ static const struct qcom_reset_map lsr_cc_seraph_resets[] = {
 	[LSR_CC_MVS0C_CLK_ARES] = { 0x8064, 2 },
 	[LSR_CC_MVS0C_BCR] = { 0x8030 },
 	[LSR_CC_MVS0C_FREERUN_CLK_ARES] = { 0x8074, 2 },
+	[LSR_CC_XO_CLK_ARES] = { 0x80d4, 2 },
 };
 
 static const struct regmap_config lsr_cc_seraph_regmap_config = {

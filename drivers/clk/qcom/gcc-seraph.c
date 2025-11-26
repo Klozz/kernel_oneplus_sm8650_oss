@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/clk-provider.h>
@@ -64,6 +64,7 @@ static struct clk_alpha_pll gcc_gpll0 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
+				[VDD_LOWER] = 700000000,
 				[VDD_LOW] = 1066000000,
 				[VDD_LOW_L1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
@@ -113,6 +114,7 @@ static struct clk_alpha_pll gcc_gpll2 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
+				[VDD_LOWER] = 700000000,
 				[VDD_LOW] = 1066000000,
 				[VDD_LOW_L1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
@@ -140,6 +142,7 @@ static struct clk_alpha_pll gcc_gpll4 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
+				[VDD_LOWER] = 700000000,
 				[VDD_LOW] = 1066000000,
 				[VDD_LOW_L1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
@@ -167,6 +170,7 @@ static struct clk_alpha_pll gcc_gpll6 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
+				[VDD_LOWER] = 700000000,
 				[VDD_LOW] = 1066000000,
 				[VDD_LOW_L1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
@@ -194,6 +198,7 @@ static struct clk_alpha_pll gcc_gpll7 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
+				[VDD_LOWER] = 700000000,
 				[VDD_LOW] = 1066000000,
 				[VDD_LOW_L1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
@@ -221,6 +226,7 @@ static struct clk_alpha_pll gcc_gpll8 = {
 			.num_rate_max = VDD_NUM,
 			.rate_max = (unsigned long[VDD_NUM]) {
 				[VDD_LOWER_D2] = 621000000,
+				[VDD_LOWER] = 700000000,
 				[VDD_LOW] = 1066000000,
 				[VDD_LOW_L1] = 1600000000,
 				[VDD_NOMINAL] = 2000000000,
@@ -3663,6 +3669,7 @@ static const struct qcom_reset_map gcc_seraph_resets[] = {
 	[GCC_LSR_AXI0_CLK_ARES] = { 0xb3008, 2 },
 	[GCC_LSR_AXI_CV_CPU_CLK_ARES] = { 0xb301c, 2 },
 	[GCC_LSR_BCR] = { 0xb3000 },
+	[GCC_LSR_XO_CLK_ARES] = { 0xb3024, 2 },
 	[GCC_PCIE_0_BCR] = { 0x6b000 },
 	[GCC_PCIE_0_LINK_DOWN_BCR] = { 0x6c014 },
 	[GCC_PCIE_0_NOCSR_COM_PHY_BCR] = { 0x6c020 },
