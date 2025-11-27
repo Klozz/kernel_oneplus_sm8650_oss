@@ -7126,7 +7126,7 @@ int msm_pcie_enumerate(u32 rc_idx)
 	struct pci_host_bridge *bridge;
 	bool found = false;
 	u32 ids, vendor_id, device_id;
-	struct pci_config_window *cfg;
+	struct pci_config_window *cfg = NULL;
 	const struct pci_ecam_ops *ecam_ops;
 	struct resource_entry *bus;
 	LIST_HEAD(res);
