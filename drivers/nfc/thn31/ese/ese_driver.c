@@ -232,7 +232,6 @@ static int ese_device_open(struct inode *inode, struct file *file)
 {
     struct ese_info *ese = NULL;
 
-    TMS_DEBUG("Kernel version : %06x, eSE driver version : %s\n", LINUX_VERSION_CODE, ESE_VERSION);
     TMS_INFO("eSE device number is %d-%d\n", imajor(inode),
               iminor(inode));
     ese = ese_get_data(inode);

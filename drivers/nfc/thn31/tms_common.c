@@ -6,39 +6,15 @@
 #include "tms_common.h"
 
 /*********** PART0: Global Variables Area ***********/
-struct tms_info *tms = NULL;
-unsigned int tms_debug = LEVEL_INFO;
+struct tms_info tms = {0};
+unsigned int shutdown = 0;
 
 /*********** PART1: Declare Area ***********/
 
 /*********** PART2: Function Area ***********/
-void tms_buffer_dump(const char *tag, const uint8_t *src, int16_t len)
-{
-    uint16_t buf_len = (len > PAGESIZE) ? PAGESIZE : len;
-    uint16_t index = 0;
-    uint16_t i;
-
-    if (tms_debug < LEVEL_DUMP) {
-        TMS_DEBUG("%s[%d] bytes", tag, len);
-    } else {
-        char buf[PAGESIZE * 2 + 1];
-        do {
-            memset(buf, 0, sizeof(buf));
-
-            for (i = 0; i < buf_len; i++) {
-                snprintf(&buf[i * 2], 3, "%02X", src[index++]);
-            }
-
-            TMS_ERR("%s[%d] %s", tag, buf_len, buf);
-            len = len - buf_len;
-            buf_len = (len > PAGESIZE) ? PAGESIZE : len;
-        } while (len > 0);
-    }
-}
-
 struct tms_info *tms_common_data_binding(void)
 {
-    return tms;
+    return &tms;
 }
 
 void tms_gpio_set(unsigned int gpio, bool state, unsigned long predelay,
@@ -54,7 +30,7 @@ void tms_gpio_set(unsigned int gpio, bool state, unsigned long predelay,
     }
 
     gpio_set_value(gpio, state);
-    TMS_DEBUG("Set gpio %d state is %d\n", gpio, state);
+    TMS_DEBUG("Set gpio[%d] %s\n", gpio, state == OFF ? "LOW" : "HIGH");
 
     if (postdelay) {
         usleep_range(postdelay, postdelay + 100);
@@ -63,7 +39,7 @@ void tms_gpio_set(unsigned int gpio, bool state, unsigned long predelay,
 
 void tms_device_unregister(struct dev_register *dev)
 {
-    device_destroy(tms->class, dev->devno);
+    device_destroy(tms.class, dev->devno);
     cdev_del(&dev->chrdev);
     unregister_chrdev_region(dev->devno, dev->count);
     TMS_DEBUG("Unregister device\n");
@@ -73,7 +49,7 @@ int tms_device_register(struct dev_register *dev, void *data)
 {
     int ret;
 
-    dev->class = tms->class;
+    dev->class = tms.class;
     ret = alloc_chrdev_region(&dev->devno, 0, dev->count, dev->name);
 
     if (ret < 0) {
@@ -89,7 +65,7 @@ int tms_device_register(struct dev_register *dev, void *data)
         goto err_free_devno;
     }
 
-    dev->creation = device_create(tms->class, NULL, dev->devno, data, dev->name);
+    dev->creation = device_create(tms.class, NULL, dev->devno, data, "%s", dev->name);
 
     if (IS_ERR(dev->creation)) {
         ret = PTR_ERR(dev->creation);
@@ -106,15 +82,15 @@ err_free_devno:
     return ret;
 }
 
-static ssize_t proc_debug_control_read(struct file *file, char __user *buf,
+static ssize_t proc_shutdown_read(struct file *file, char __user *buf,
                                        size_t count, loff_t *ppos)
 {
     char page[PAGESIZE] = {0};
-    snprintf(page, PAGESIZE - 1, "%u\n", tms_debug);
+    snprintf(page, PAGESIZE - 1, "%u\n", shutdown);
     return simple_read_from_buffer(buf, count, ppos, page, strlen(page));
 }
 
-static ssize_t proc_debug_control_write(struct file *file,
+static ssize_t proc_shutdown_write(struct file *file,
                                         const char __user *buf, size_t count, loff_t *lo)
 {
     int tmp = 0;
@@ -125,7 +101,7 @@ static ssize_t proc_debug_control_write(struct file *file,
     }
 
     if (sscanf(buffer, "%d", &tmp) == 1) {
-        tms_debug = tmp;
+        shutdown = tmp;
     } else {
         return -EPERM;
     }
@@ -133,7 +109,7 @@ static ssize_t proc_debug_control_write(struct file *file,
     return count;
 }
 
-DECLARE_PROC_OPS(proc_debug_control_ops, simple_open, proc_debug_control_read, proc_debug_control_write, NULL);
+DECLARE_PROC_OPS(proc_shutdown_ops, simple_open, proc_shutdown_read, proc_shutdown_write, NULL, NULL);
 
 /*********** PART3: TMS Common Start Area ***********/
 static int tms_proc_init(void)
@@ -141,71 +117,68 @@ static int tms_proc_init(void)
     int ret;
     struct proc_dir_entry *prEntry_tmp = NULL;
 
-    tms->prEntry = proc_mkdir("tmsdev", NULL);
-
-    if (tms->prEntry == NULL) {
+    tms.prEntry = proc_mkdir("tmsdev", NULL);
+    if (tms.prEntry == NULL) {
         TMS_ERR("Couldn't create tmsdev proc entry\n");
         return -ENOMEM;
     }
 
-    prEntry_tmp = proc_create_data("debug_level", 0644, tms->prEntry,
-                                   &proc_debug_control_ops, NULL);
+    ret = tms_debuger_proc_create(tms.prEntry);
+    if (ret) {
+        TMS_ERR("Couldn't create debuger procs entry\n");
+        return ret;
+    }
 
+    prEntry_tmp = proc_create_data("shutdown", 0664, tms.prEntry,
+                                   &proc_shutdown_ops, NULL);
     if (prEntry_tmp == NULL) {
-        ret = -ENODEV;
-        TMS_ERR("Couldn't create debug_level proc entry\n");
-        goto err_remove_proc;
+        TMS_ERR("Couldn't create shutdown proc entry\n");
+        return -ENODEV;
     }
 
     return SUCCESS;
-err_remove_proc:
-    remove_proc_subtree("tmsdev", NULL);
-    return ret;
 }
 
 static int tms_common_probe(void)
 {
     int ret;
-    TMS_INFO("Enter\n");
 
-    /* step1 : alloc tms common data */
-    tms = kzalloc(sizeof(struct tms_info), GFP_KERNEL);
+    /* step1 : binding common data and function */
+    tms.vendor           = "tms";
+    tms.registe_device   = tms_device_register;
+    tms.unregiste_device = tms_device_unregister;
+    tms.set_gpio         = tms_gpio_set;
 
-    if (tms == NULL) {
-        TMS_ERR("TMS info alloc memory error\n");
-        return -ENOMEM;
+    /* step2 : init debuger */
+    ret = tms_debuger_init();
+    if (ret) {
+        TMS_ERR("debuger init failed, ret = %d\n", ret);
     }
 
-    memset(tms, 0, sizeof(*tms));
-    /* step2 : tms class register */
-    tms->class = class_create(THIS_MODULE, DEVICES_CLASS_NAME);
-
-    if (IS_ERR(tms->class)) {
-        ret = PTR_ERR(tms->class);
-        TMS_ERR("Failed to register device class\n");
-        goto err_free_tms_info;
-    }
-
-    /* step3 : binding common data and function */
-    tms->nfc_name         = "thn31";
-    tms->registe_device   = tms_device_register;
-    tms->unregiste_device = tms_device_unregister;
-    tms->set_gpio         = tms_gpio_set;
-    /* step4 : init proc */
+    /* step3 : init proc */
     ret = tms_proc_init();
-
     if (ret) {
         TMS_ERR("NFC device proc create failed.\n");
-        goto err_destroy_class;
+        goto exit;
+    }
+
+    /* step4 : tms class register */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,3,0)
+    tms.class = class_create(THIS_MODULE, DEVICES_CLASS_NAME);
+#else
+    tms.class = class_create(DEVICES_CLASS_NAME);
+#endif
+
+    if (IS_ERR(tms.class)) {
+        ret = PTR_ERR(tms.class);
+        TMS_ERR("Failed to register device class\n");
+        goto exit;
     }
 
     TMS_INFO("Successfully\n");
     return SUCCESS;
-err_destroy_class:
-    class_destroy(tms->class);
-err_free_tms_info:
-    kfree(tms);
-    tms = NULL;
+
+exit:
     TMS_ERR("Failed, ret = %d\n", ret);
     return ret;
 }
@@ -215,9 +188,14 @@ static int __init tms_driver_init(void)
 {
     int ret = 0;
 
+    TMS_INFO("Kernel : %d.%d.%d, Driver version : %x\n",
+             (LINUX_VERSION_CODE >> 16) & 0xFFFF,
+             (LINUX_VERSION_CODE >> 8) & 0xFF,
+             LINUX_VERSION_CODE & 0xFF,
+             DRIVER_VERSION);
     ret = tms_common_probe();
     if (ret) {
-        TMS_ERR("Unable to init TMS Common, ret = %d\n", ret);
+        TMS_ERR("Failed to init Common\n");
         goto err;
     }
 
@@ -240,6 +218,7 @@ err:
 
 static void __exit tms_driver_exit(void)
 {
+    TMS_INFO("Enter\n");
 #if IS_ENABLED(CONFIG_TMS_GUIDE_DEVICE)
     tms_guide_exit();
 #else
@@ -252,14 +231,12 @@ static void __exit tms_driver_exit(void)
 #endif
 
     remove_proc_subtree("tmsdev", NULL);
-    if (!IS_ERR(tms->class)) {
-        class_destroy(tms->class);
+    tms_debuger_deinit();
+    if (!IS_ERR(tms.class)) {
+        class_destroy(tms.class);
     }
 
-    if (tms) {
-        kfree(tms);
-        tms = NULL;
-    }
+    memset(&tms, 0, sizeof(struct tms_info));
 }
 
 module_init(tms_driver_init);

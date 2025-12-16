@@ -4,6 +4,7 @@
  */
 
 #include "nfc_common.h"
+#include <linux/of.h>
 #include "../../../../include/linux/pinctrl/qcom-pinctrl.h"
 
 /*********** PART0: Global Variables Area ***********/
@@ -44,6 +45,27 @@ void nfc_hard_reset(struct nfc_info *nfc)
     nfc->tms->set_gpio(nfc->hw_res.ven_gpio, ON, WAIT_TIME_NONE, WAIT_TIME_20000US);
 }
 
+void nfc_read_flush(struct nfc_info *nfc)
+{
+    /*
+     * release blocked user thread waiting for pending read
+     */
+    if (mutex_trylock(&nfc->read_mutex)) {
+        TMS_DEBUG("Read thread already released\n");
+        goto unlock;
+    }
+
+    nfc->release_read = true;
+    nfc_disable_irq(nfc);
+    wake_up(&nfc->read_wq);
+    TMS_DEBUG("Waiting for release of blocked read\n");
+    mutex_lock(&nfc->read_mutex);
+    nfc->release_read = false;
+
+unlock:
+    mutex_unlock(&nfc->read_mutex);
+}
+
 static bool nfc_write(struct i2c_client *client, const uint8_t *cmd, size_t len)
 {
     int count;
@@ -56,6 +78,7 @@ static bool nfc_write(struct i2c_client *client, const uint8_t *cmd, size_t len)
             return true;
         }
 
+        usleep_range(WAIT_TIME_1000US, WAIT_TIME_1000US + 100);
         TMS_ERR("Error writting: %zd\n", ret);
     }
 
@@ -77,6 +100,10 @@ static bool nfc_read_header(struct i2c_client *client, unsigned int irq_gpio,
         usleep_range(WAIT_TIME_1000US, WAIT_TIME_1000US + 100);
     } while (retry--);
 
+    if (retry < 0) {
+        TMS_ERR("Reading header timeout\n");
+        return false;
+    }
     ret = i2c_master_recv(client, header, header_len);
     if (ret == header_len) {
         tms_buffer_dump("Rx <-", header, header_len);
@@ -103,6 +130,11 @@ static bool nfc_read_payload(struct i2c_client *client, unsigned int irq_gpio,
         usleep_range(WAIT_TIME_1000US, WAIT_TIME_1000US + 100);
     } while (retry--);
 
+    if (retry < 0) {
+        TMS_ERR("Reading payload timeout\n");
+        return false;
+    }
+
     ret = i2c_master_recv(client, payload, read_len);
     if (ret == read_len) {
         tms_buffer_dump("Rx <-", payload, payload_len);
@@ -122,8 +154,8 @@ void nfc_jump_fw(struct i2c_client *client, unsigned int irq_gpio)
     /* It is possible to receive up to two times and redundant once */
     int retry = 2;
 
+    TMS_DEBUG("Enter\n");
     if (!nfc_write(client, core_reset, sizeof(core_reset))) {
-        TMS_ERR("send core_reset error\n");
         return;
     }
 
@@ -133,7 +165,6 @@ void nfc_jump_fw(struct i2c_client *client, unsigned int irq_gpio)
         }
 
         if (!nfc_read_payload(client, irq_gpio, rsp_payload, rsp_hdr[HEAD_PAYLOAD_BYTE])) {
-            TMS_ERR("Read core_reset rsp payload error\n");
             return;
         }
 
@@ -143,6 +174,7 @@ void nfc_jump_fw(struct i2c_client *client, unsigned int irq_gpio)
             retry = 1;
             continue;
         } else if ((!memcmp(rsp_hdr, chk_rsp_hdr, NCI_HDR_LEN)) && rsp_payload[0] == 0x00) {
+            TMS_DEBUG("Already in FW\n");
             /* Core reset NTF needs to be received in FW */
             retry = 1;
             continue;
@@ -427,7 +459,7 @@ static int nfc_platform_clk_init(struct nfc_info *nfc)
 
     ret = IS_ERR(nfc->clk);
     if (ret) {
-        TMS_ERR("Platform clock not specified\n, ret = %d\n", ret);
+        TMS_WARN("Platform clock not specified, ret = %d\n", ret);
         return ret;
     }
 
@@ -435,7 +467,7 @@ static int nfc_platform_clk_init(struct nfc_info *nfc)
 
     ret = IS_ERR(nfc->clk_parent);
     if (ret) {
-        TMS_ERR("Clock parent not specified\n, ret = %d\n", ret);
+        TMS_ERR("Clock parent not specified, ret = %d\n", ret);
         return ret;
     }
 
@@ -445,7 +477,7 @@ static int nfc_platform_clk_init(struct nfc_info *nfc)
 
     ret = IS_ERR(nfc->clk_enable);
     if (ret) {
-        TMS_ERR("Clock enable not specified\n, ret = %d\n", ret);
+        TMS_ERR("Clock enable not specified, ret = %d\n", ret);
         return ret;
     }
 
@@ -534,18 +566,19 @@ static int nfc_parse_dts_init(struct nfc_info *nfc)
         rcv = gpio_request(nfc->hw_res.download_gpio, "nfc_fw_download");
 
         if (rcv) {
-            TMS_WARN("Unable to request gpio[%d] as FWDownLoad\n",
+            TMS_WARN("Unable to request gpio[%d] as DownLoad\n",
                      nfc->hw_res.download_gpio);
         }
     } else {
         nfc->tms->feature.dl_support = false;
-        TMS_ERR("FW-Download gpio not specified\n");
+        TMS_WARN("Download gpio not specified or non-pin\n");
     }
 
     TMS_DEBUG("NFC device name is %s, count = %d\n", nfc->dev.name,
               nfc->dev.count);
     TMS_INFO("irq_gpio = %d, ven_gpio = %d, download_gpio = %d\n",
-             nfc->hw_res.irq_gpio, nfc->hw_res.ven_gpio, nfc->hw_res.download_gpio);
+             nfc->hw_res.irq_gpio, nfc->hw_res.ven_gpio,
+             nfc->tms->feature.dl_support ? nfc->hw_res.download_gpio : -1);
     return SUCCESS;
 err_free_irq:
     gpio_free(nfc->hw_res.irq_gpio);
@@ -556,6 +589,7 @@ err_free_irq:
 int nfc_common_info_init(struct nfc_info *nfc)
 {
     int ret;
+    unsigned int clkreq_gpio = 0;
     TMS_INFO("Enter\n");
     /* step1 : binding tms common data */
     nfc->tms = tms_common_data_binding();
@@ -567,11 +601,23 @@ int nfc_common_info_init(struct nfc_info *nfc)
 
     /* step2 : dts parse */
     ret = nfc_parse_dts_init(nfc);
-    msm_gpio_mpm_wake_set(6,1);
 
     if (ret) {
         TMS_ERR("Parse dts failed.\n");
         return ret;
+    }
+
+    ret = of_property_read_u32_index(nfc->i2c_dev->of_node, "tms,clkreq-gpio", 1, &clkreq_gpio);
+
+    if (ret < 0) {
+        TMS_ERR("Failed to read clkreq gipo number, ret = %d\n", ret);
+        return ret;
+    }
+
+    ret = msm_gpio_mpm_wake_set(clkreq_gpio,1);
+
+    if (ret < 0) {
+        TMS_ERR("Failed to setup clkreq gpio %d as wakeup capable, ret= %d\n", clkreq_gpio, ret);
     }
 
     /* step3 : Configure platform clock */

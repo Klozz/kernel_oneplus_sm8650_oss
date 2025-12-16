@@ -21,36 +21,23 @@
 #include <linux/sched.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
-#include <linux/proc_fs.h>
 #include <linux/io.h>
 #include <linux/clk.h>
+#include "debuger/tms_debuger.h"
 
-/*********** PART1: LOG TAG Declear***********/
-#define log_fmt(fmt) "[TMS-%s]%s: " fmt
-#define TMS_ERR(a, arg...)\
-    pr_err(log_fmt(a), TMS_MOUDLE, __func__, ##arg)
-
-#define TMS_WARN(a, arg...)\
-    do{\
-        if (tms_debug >= LEVEL_WARN)\
-            pr_err(log_fmt(a), TMS_MOUDLE, __func__, ##arg);\
-    }while(0)
-
-#define TMS_INFO(a, arg...)\
-    do{\
-        if (tms_debug >= LEVEL_INFO)\
-            pr_err(log_fmt(a), TMS_MOUDLE, __func__, ##arg);\
-    }while(0)
-
-#define TMS_DEBUG(a, arg...)\
-    do{\
-        if (tms_debug >= LEVEL_DEBUG)\
-            pr_err(log_fmt(a), TMS_MOUDLE, __func__, ##arg);\
-    }while(0)
+/*********** PART1: Driver Version Define Area ***********/
+#define MAJOR_VERSION       (1)
+#define MINOR_VERSION       (2)
+#define MAINTENANCE_VERSION (3)
+#define DRIVER_VERSION      (MAJOR_VERSION << 16) + \
+                            (MINOR_VERSION << 8) + \
+                            (MAINTENANCE_VERSION)
 
 /*********** PART2: Define Area ***********/
+#ifdef TMS_MOUDLE
+#undef TMS_MOUDLE
 #define TMS_MOUDLE                "Common"
-#define TMS_VERSION               "010202"
+#endif
 #define DEVICES_CLASS_NAME        "tms"
 #define OFF                       0    /* Device power off */
 #define ON                        1    /* Device power on */
@@ -58,7 +45,6 @@
 #define ERROR                     1
 #define PAGESIZE                  512
 #define WAIT_TIME_NONE            0
-#define WAIT_TIME_1000US         1000
 #define WAIT_TIME_500US           500
 #define WAIT_TIME_1000US          1000
 #define WAIT_TIME_5000US          5000
@@ -66,20 +52,21 @@
 #define WAIT_TIME_20000US         20000
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
-#define DECLARE_PROC_OPS(node_ops, open_func, read_func, write_func, release_func) \
-static const struct proc_ops node_ops = { \
+#define DECLARE_PROC_OPS(ops, open_func, read_func, write_func, llseek_func, release_func) \
+static const struct proc_ops ops = { \
     .proc_open    = open_func,            \
     .proc_read    = read_func,            \
     .proc_write   = write_func,           \
+    .proc_lseek   = llseek_func,          \
     .proc_release = release_func,         \
-    .proc_lseek   = default_llseek,       \
 }
 #else
-#define DECLARE_PROC_OPS(node_ops, open_func, read_func, write_func, release_func) \
-static const struct file_operations node_ops = { \
+#define DECLARE_PROC_OPS(ops, open_func, read_func, write_func, llseek_func, release_func) \
+static const struct file_operations ops = { \
     .open    = open_func,                        \
     .read    = read_func,                        \
     .write   = write_func,                       \
+    .llseek  = llseek_func,                      \
     .release = release_func,                     \
     .owner   = THIS_MODULE,                      \
 }
@@ -114,7 +101,7 @@ struct tms_feature {
 struct tms_info {
     bool                        ven_enable; /* store VEN state */
     int                         dev_count;
-    char                        *nfc_name;
+    char                        *vendor;
     struct class                *class;
     struct hw_resource          hw_res;
     struct proc_dir_entry       *prEntry;
@@ -126,18 +113,8 @@ struct tms_info {
                                  unsigned long postdelay);
 };
 
-typedef enum {
-    LEVEL_DEFAULT = 0, /* print dirver error info */
-    LEVEL_WARN,        /* print driver warning info */
-    LEVEL_INFO,        /* print basic debug info */
-    LEVEL_DEBUG,       /* print all debug info */
-    LEVEL_DUMP,        /* print I/O buffer info */
-} tms_debug_level;
-
 /*********** PART4: Function or variables for other files ***********/
-extern unsigned int tms_debug;
 struct tms_info *tms_common_data_binding(void);
-void tms_buffer_dump(const char *tag, const uint8_t *src, int16_t len);
 int nfc_driver_init(void);
 void nfc_driver_exit(void);
 int ese_driver_init(void);

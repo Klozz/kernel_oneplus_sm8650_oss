@@ -64,14 +64,14 @@ static int i2c_master_block_recv(struct nfc_info *nfc, uint8_t *buf, size_t coun
                 break;
             }
 
-            if (!gpio_get_value(nfc->hw_res.irq_gpio)) {
-                TMS_ERR("Can not detect interrupt\n");
-                return -EIO;
-            }
-
             if (nfc->release_read) {
                 TMS_ERR("Releasing read\n");
                 return -EWOULDBLOCK;
+            }
+
+            if (!gpio_get_value(nfc->hw_res.irq_gpio)) {
+                TMS_ERR("Can not detect interrupt\n");
+                return -EIO;
             }
 
             TMS_WARN("Spurious interrupt detected\n");
@@ -116,19 +116,7 @@ static int nfc_ioctl_set_state(struct nfc_info *nfc, unsigned long arg)
         break;
 
     case NFC_DLD_FLUSH:
-        /*
-         * release blocked user thread waiting for pending read
-         */
-        if (!mutex_trylock(&nfc->read_mutex)) {
-            nfc->release_read = true;
-            nfc_disable_irq(nfc);
-            wake_up(&nfc->read_wq);
-            TMS_DEBUG("Waiting for release of blocked read\n");
-            mutex_lock(&nfc->read_mutex);
-            nfc->release_read = false;
-        }
-
-        mutex_unlock(&nfc->read_mutex);
+        nfc_read_flush(nfc);
         break;
 
     default:
@@ -189,18 +177,8 @@ int nfc_device_flush(struct file *file, fl_owner_t id)
         return -ENODEV;
     }
 
-    if (!mutex_trylock(&nfc->read_mutex)) {
-        nfc->release_read = true;
-        nfc_disable_irq(nfc);
-        wake_up(&nfc->read_wq);
-        TMS_DEBUG("Waiting for release of blocked read\n");
-        mutex_lock(&nfc->read_mutex);
-        nfc->release_read = false;
-    } else {
-        TMS_DEBUG("Read thread already released\n");
-    }
+    nfc_read_flush(nfc);
 
-    mutex_unlock(&nfc->read_mutex);
     return SUCCESS;
 }
 
@@ -416,8 +394,6 @@ static int nfc_device_open(struct inode *inode, struct file *file)
 {
     struct nfc_info *nfc = NULL;
 
-    TMS_DEBUG("Kernel version : %06x, NFC driver version : %s\n", LINUX_VERSION_CODE,
-             NFC_VERSION);
     TMS_INFO("NFC device number is %d-%d\n", imajor(inode),
               iminor(inode));
     nfc = nfc_get_data(inode);
@@ -507,6 +483,7 @@ int nfc_device_probe(struct i2c_client *client)
     nfc->i2c_dev            = &client->dev;
     nfc->irq_enable         = true;
     nfc->irq_wake_up        = false;
+    nfc->release_read       = false;
     nfc->dev.fops           = &nfc_fops;
     /* step3 : register nfc info*/
     ret = nfc_common_info_init(nfc);
@@ -518,7 +495,7 @@ int nfc_device_probe(struct i2c_client *client)
 
     /* step4 : I2C function check */
     if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
-        TMS_ERR("need I2C_FUNC_I2C\n");
+        TMS_ERR("Unsupported I2C_FUNC_I2C\n");
         ret = -ENODEV;
         goto err_free_nfc_info;
     }

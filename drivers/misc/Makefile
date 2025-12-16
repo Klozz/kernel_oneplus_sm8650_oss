@@ -72,35 +72,9 @@ obj-$(CONFIG_BOOTMARKER_PROXY) 	+= bootmarker_proxy.o
 obj-$(CONFIG_KINECTICS_XR_NORDIC) += kxrctrl/
 obj-$(CONFIG_VD628x)      += vd628x/
 
-obj-y	+= tri_state_key/
-
-#ifdef OPLUS_FEATURE_RF_CABLE_DETECT
-oplus_network_rf_cable_monitor-y           := oplus_rf_cable_monitor.o
-obj-$(CONFIG_OPLUS_RF_CABLE_MONITOR)   += oplus_network_rf_cable_monitor.o
-#endif /* OPLUS_FEATURE_RF_CABLE_DETECT */
-
-#ifdef OPLUS_FEATURE_SIM_DETECT
-oplus_network_sim_detect-y := sim_detect.o
-obj-$(CONFIG_SIM_DETECT)	+= oplus_network_sim_detect.o
-#endif
-
-#ifdef OPLUS_FEATURE_SIM_DETECT
-oplus_network_oem_qmi-y := oem_qmi_client.o
-obj-$(CONFIG_OEM_QMI)	+= oplus_network_oem_qmi.o
-#endif
-
-obj-$(CONFIG_OPLUS_GPIO) += oplus_network_esim.o
-
 #ifdef OPLUS_FEATURE_CHG_BASIC
 obj-$(CONFIG_AW8697_HAPTIC) += vibrator/aw8697_haptic/
 obj-$(CONFIG_SIH_VIBRATOR) += vibrator/si_haptic/
+obj-$(CONFIG_OPLUS_HAPTIC_COMMON) += vibrator/oplus_haptic/
 #endif
 obj-$(CONFIG_OPLUS_POWER_NOTIFIER) += oplus_power_notifier/
-
-#ifdef CONFIG_OPLUS_SENSOR_CONSUMER_IR
-obj-$(CONFIG_OPLUS_SENSOR_CONSUMER_IR_CORE) += oplus_consumer_ir/
-#endif /* CONFIG_OPLUS_SENSOR_CONSUMER_IR */
-
-#ifdef CONFIG_OPLUS_SYNC_FENCE
-obj-$(CONFIG_OPLUS_SYNC_FENCE) += oplus_sync_fence/
-#endif /* CONFIG_OPLUS_SYNC_FENCE */

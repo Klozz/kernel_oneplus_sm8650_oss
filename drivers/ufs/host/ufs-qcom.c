@@ -972,7 +972,7 @@ static int ufs_qcom_enable_hw_clk_gating(struct ufs_hba *hba)
 			UNUSED_UNIPRO_CLK_GATED, UFS_AH8_CFG);
 
 	/* Ensure that HW clock gating is enabled before next operations */
-	ufshcd_readl(hba, REG_UFS_CFG2);
+	mb();
 
 	/* Enable Qunipro internal clock gating if supported */
 	if (!ufs_qcom_cap_qunipro_clk_gating(host))
@@ -3052,7 +3052,7 @@ static void ufs_qcom_save_host_ptr(struct ufs_hba *hba)
 /*feature-memorymonitor-v001-1-begin*/
 static int monitor_verify_command(unsigned char *cmd)
 {
-    if (cmd[0] != 0x3B && cmd[0] != 0x3C && cmd[0] != 0xC0)
+    if (cmd[0] != 0x3B && cmd[0] != 0x3C && cmd[0] != 0xC0 && cmd[0] != 0xD0)
         return false;
 
     return true;
@@ -3102,7 +3102,8 @@ int ufs_ioctl_monitor(struct scsi_device *dev, void __user *buf_user)
 	scmd = blk_mq_rq_to_pdu(req);
 
 	cmdlen = COMMAND_SIZE(opcode);
-	if ((VENDOR_SPECIFIC_CDB == opcode) &&(0 == strncmp(dev->vendor, "SAMSUNG ", 8)))
+	if (((VENDOR_SPECIFIC_CDB == opcode) && (0 == strncmp(dev->vendor, "SAMSUNG ", 8)))
+		|| (0 == strncmp(dev->vendor, "SKhynix ", 8)))
 		cmdlen = 16;
 
 	/*
@@ -6089,8 +6090,6 @@ static void ufs_qcom_config_scaling_param(struct ufs_hba *hba,
 	p->timer = DEVFREQ_TIMER_DELAYED;
 	d->upthreshold = 70;
 	d->downdifferential = 65;
-
-	hba->clk_scaling.suspend_on_no_request = true;
 }
 
 #else
@@ -6990,6 +6989,7 @@ static void ufs_qcom_update_sdev(void *param, struct scsi_device *sdev)
 	if (strcmp(sdev->model,ufs_null_device_strs) && atomic_inc_return(&ufs_init_done)==1){
 		create_devinfo_ufs(sdev);
 	}
+	blk_queue_flag_set(QUEUE_FLAG_SAME_FORCE, sdev->request_queue);
 }
 /*feature-devinfo-v001-5-end*/
 /*

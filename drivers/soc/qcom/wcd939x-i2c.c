@@ -708,7 +708,7 @@ static int wcd_usbss_surge_kthread_fn(void *p)
 				}
 				wcd_usbss_reset_routine();
 //#if IS_ENABLED(CONFIG_OPLUS_FEATURE_MM_FEEDBACK)
-				if (!(wcd_usbss_ctxt_->cable_status & (BIT(WCD_USBSS_USB)))) {
+				if (!(wcd_usbss_ctxt_->cable_status & (BIT(WCD_USBSS_USB) | BIT(WCD_USBSS_CHARGER)))) {
 					mm_fb_audio_kevent_named(OPLUS_AUDIO_EVENTID_HEADSET_DET, MM_FB_KEY_RATELIMIT_5MIN, \
 					"payload@@negative surge occurs, cable_status = %d", wcd_usbss_ctxt_->cable_status);
 				}

@@ -44,12 +44,30 @@
 #include "qcom_q6v5.h"
 #include "remoteproc_internal.h"
 
+//#ifdef OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT
+#include <soc/oplus/system/oplus_project.h>
+//#endif /* OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT */
+
 #define XO_FREQ		19200000
 #define PIL_TZ_AVG_BW	UINT_MAX
 #define PIL_TZ_PEAK_BW	UINT_MAX
 
 #define ADSP_DECRYPT_SHUTDOWN_DELAY_MS	100
 #define RPROC_HANDOVER_POLL_DELAY_MS	1
+
+//#ifdef OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT
+#define MAX_MODEM_FIRMWARE_NAME_SIZE  16
+
+static uint32_t g_need_select_firmware_prjects[] = {
+	25861,
+};
+
+static char g_modem_firmware_name[][MAX_MODEM_FIRMWARE_NAME_SIZE] = {
+	"",
+	"modem.mdt",
+	"modem2.mdt",
+};
+//#endif /* OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT */
 
 static struct icc_path *scm_perf_client;
 static int scm_pas_bw_count;
@@ -698,6 +716,30 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(qcom_rproc_set_dtb_firmware);
+
+//#ifdef OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT
+static bool is_need_select_firmware(uint32_t project_id)
+{
+	unsigned int i;
+	for (i = 0; i < sizeof(g_need_select_firmware_prjects)/sizeof(uint32_t); i++) {
+		if (project_id == g_need_select_firmware_prjects[i]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static char *modem_firmware_select_by_rfid(unsigned int rfid)
+{
+	unsigned int modem_id_list_size = sizeof(g_modem_firmware_name)/MAX_MODEM_FIRMWARE_NAME_SIZE;
+	pr_info("modem_firmware_select_by_rfid modem_id_list_size = %u\n", modem_id_list_size);
+	if (rfid >= modem_id_list_size) {
+		pr_err("modem_firmware_select_by_rfid rfid = %u is out of range\n", rfid);
+		return g_modem_firmware_name[0];
+	}
+	return g_modem_firmware_name[rfid];
+}
+//#endif /* OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT */
 
 static int adsp_start(struct rproc *rproc)
 {
@@ -1805,6 +1847,11 @@ static int adsp_probe(struct platform_device *pdev)
 	char md_dev_name[32];
 	int ret;
 	bool signal_aop;
+//#ifdef OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT
+	unsigned int project;
+	unsigned int rfid;
+	const char *modem_firmware_name;
+//#endif /* OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT */
 
 	desc = of_device_get_match_data(&pdev->dev);
 	if (!desc)
@@ -1813,11 +1860,22 @@ static int adsp_probe(struct platform_device *pdev)
 	if (!qcom_scm_is_available())
 		return -EPROBE_DEFER;
 
-	fw_name = desc->firmware_name;
-	ret = of_property_read_string(pdev->dev.of_node, "firmware-name",
-				      &fw_name);
-	if (ret < 0 && ret != -EINVAL)
-		return ret;
+//#ifdef OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT
+	project = get_project();
+	pr_info("adsp_probe: project = %u, firmware name = %s\n", project, desc->firmware_name);
+	if (is_need_select_firmware(project)
+		&& strncmp(desc->firmware_name, "modem.mdt", strlen("modem.mdt")) == 0) {
+		rfid = get_RF_ID();
+		modem_firmware_name = modem_firmware_select_by_rfid(rfid);
+		pr_info("adsp_probe: modem_firmware_name = %s\n", modem_firmware_name);
+		fw_name = modem_firmware_name;
+	} else {
+		fw_name = desc->firmware_name;
+		ret = of_property_read_string(pdev->dev.of_node, "firmware-name", &fw_name);
+		if (ret < 0 && ret != -EINVAL)
+			return ret;
+	}
+//#endif /* OPLUS_FEATURE_SUBSYSTEM_FIRMWARE_SELECT */
 
 	if (desc->minidump_id)
 		ops = &adsp_minidump_ops;

@@ -1367,9 +1367,6 @@ config TOUCHSCREEN_IQS5XX
 	  To compile this driver as a module, choose M here: the
 	  module will be called iqs5xx.
 
-source "drivers/input/touchscreen/touch_custom/Kconfig"
-source "drivers/input/touchscreen/oplus_touchscreen_v2/Kconfig"
-
 config TOUCHSCREEN_IQS7211
 	tristate "Azoteq IQS7210A/7211A/E trackpad/touchscreen controller"
 	depends on I2C
@@ -1392,5 +1389,4 @@ config TOUCHSCREEN_ZINITIX
 	  To compile this driver as a module, choose M here: the
 	  module will be called zinitix.
 
-source "drivers/input/touchscreen/synaptics_hbp/Kconfig"
 endif

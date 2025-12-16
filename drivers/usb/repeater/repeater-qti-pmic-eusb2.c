@@ -581,7 +581,7 @@ static ssize_t proc_repeater_parameters_write(struct file *filp, const char __us
 	}
 
 	while (*str != '\0' && *str != '\n') {
-		if (sscanf(str, "%x", &val) && val != 0) {
+		if (sscanf(str, "%x", &val)) {
 			seq[cnt++] = val;
 			str = strstr(str, ",");
 			if (!str)

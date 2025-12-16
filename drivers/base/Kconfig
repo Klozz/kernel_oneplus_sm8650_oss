@@ -231,4 +231,5 @@ config GENERIC_ARCH_NUMA
 	  and ARM64 use it.
 
 source "drivers/base/kernelFwUpdate/Kconfig"
+source "drivers/base/touchpanel_notify/Kconfig"
 endmenu
