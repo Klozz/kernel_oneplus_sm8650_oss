@@ -244,7 +244,8 @@ int evdi_drm_gem_mmap(struct file *filp, struct vm_area_struct *vma)
 	{
 		struct drm_gem_object *gobj = vma->vm_private_data;
 		if (gobj && !evdi_drm_gem_object_use_import_attach(gobj)) {
-			vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+			/* We use noncached to avoid stuttering with MGLRU */
+			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 		}
 	}
 #endif

@@ -302,7 +302,7 @@ struct evdi_event *evdi_event_alloc(struct evdi_device *evdi,
 	if (!cache)
 		cache = global_event_pool.cache;
 
-	event = kmem_cache_alloc(cache, GFP_ATOMIC);
+	event = kmem_cache_alloc(cache, GFP_ATOMIC | __GFP_HIGH);
 	if (unlikely(!event))
 		return NULL;
 

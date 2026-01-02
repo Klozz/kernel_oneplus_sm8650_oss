@@ -49,6 +49,7 @@ static int evdi_connector_get_modes(struct drm_connector *connector)
 	struct evdi_device *evdi = connector->dev->dev_private;
 	struct drm_display_mode *mode;
 	int id;
+	int refresh;
 
 	id = evdi_connector_slot(evdi, connector);
 	if (unlikely(id < 0) || !evdi_likely_connected(evdi, id))
@@ -69,7 +70,15 @@ static int evdi_connector_get_modes(struct drm_connector *connector)
 	mode->vsync_end = mode->vsync_start + 1;
 	mode->vtotal = mode->vsync_end + 1;
 
-	mode->clock = mode->htotal * mode->vtotal * evdi->displays[id].refresh_rate / 1000;
+	/*If the refresh rate is low, we force 120Hz for the 8 Gen 3 */
+	refresh = evdi->displays[id].refresh_rate;
+	if (refresh < 120) refresh = 120;
+
+	mode->clock = mode->htotal * mode->vtotal * refresh / 1000;
+
+#ifdef DRM_MODE_TYPE_PREFERRED
+	mode->vdisplay = evdi->displays[id].height;
+#endif
 
 	mode->type = DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
 
