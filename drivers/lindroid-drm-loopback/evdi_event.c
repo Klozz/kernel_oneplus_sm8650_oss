@@ -371,7 +371,7 @@ struct evdi_event *evdi_event_alloc(struct evdi_device *evdi,
 	}
 	EVDI_PERF_INC64(&evdi_perf.event_freelist_pop_misses);
 
-	event = kmem_cache_alloc(global_event_pool.cache, GFP_ATOMIC);
+	event = kmem_cache_alloc(global_event_pool.cache, GFP_ATOMIC | __GFP_HIGH);
 	if (likely(event)) {
 		atomic64_inc(&evdi->events.pool_hits);
 		EVDI_PERF_INC64(&evdi_perf.pool_alloc_fast);

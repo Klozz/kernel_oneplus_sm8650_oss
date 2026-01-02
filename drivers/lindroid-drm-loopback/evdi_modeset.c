@@ -100,7 +100,8 @@ int evdi_modeset_init(struct drm_device *dev)
 	dev->mode_config.max_height = 8192;
 
 	dev->mode_config.preferred_depth = 24;
-	dev->mode_config.prefer_shadow = 1;
+	/* We disabled prefer_shadow to prevent copy lag.*/
+	dev->mode_config.prefer_shadow = 0;//dont do extra copy of all on ram
 
 	dev->mode_config.funcs = &evdi_mode_config_funcs;
 
