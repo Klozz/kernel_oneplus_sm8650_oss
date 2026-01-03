@@ -668,6 +668,13 @@ enum ufshcd_android_quirks {
 	 * keys were stored in it.
 	 */
 	UFSHCD_ANDROID_QUIRK_KEYS_IN_PRDT		= 1 << 2,
+
+	/*
+	 * This quirk indicates that DME_LINKSTARTUP should not be issued a 2nd
+	 * time (refer link_startup_again) after the 1st time was successful,
+	 * because it causes link startup to become unreliable.
+	 */
+	UFSHCD_QUIRK_PERFORM_LINK_STARTUP_ONCE		= 1 << 19,
 };
 
 enum ufshcd_caps {

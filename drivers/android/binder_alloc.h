@@ -9,6 +9,7 @@
 #include <linux/rbtree.h>
 #include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/spinlock.h>
 #include <linux/rtmutex.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
@@ -59,16 +60,31 @@ struct binder_buffer {
 };
 
 /**
- * struct binder_lru_page - page object used for binder shrinker
- * @page_ptr: pointer to physical page in mmap'd space
- * @lru:      entry in binder_freelist
- * @alloc:    binder_alloc for a proc
+ * struct binder_shrinker_mdata - binder metadata used to reclaim pages
+ * @lru:         LRU entry in binder_freelist
+ * @alloc:       binder_alloc owning the page to reclaim
+ * @page_index:  offset in @alloc->pages[] into the page to reclaim
  */
+struct binder_shrinker_mdata {
+	struct list_head lru;
+	struct binder_alloc *alloc;
+	unsigned long page_index;
+};
+
 struct binder_lru_page {
 	struct list_head lru;
 	struct page *page_ptr;
 	struct binder_alloc *alloc;
 };
+
+static inline struct list_head *page_to_lru(struct page *p)
+{
+	struct binder_shrinker_mdata *mdata;
+
+	mdata = (struct binder_shrinker_mdata *)page_private(p);
+
+	return &mdata->lru;
+}
 
 /**
  * struct binder_alloc - per-binder proc state for binder allocator
@@ -96,7 +112,7 @@ struct binder_lru_page {
  * struct binder_buffer objects used to track the user buffers
  */
 struct binder_alloc {
-	struct mutex mutex;
+	spinlock_t lock;
 	struct vm_area_struct *vma;
 	struct mm_struct *mm;
 	void __user *buffer;
@@ -141,8 +157,6 @@ void binder_alloc_print_allocated(struct seq_file *m,
 				  struct binder_alloc *alloc);
 void binder_alloc_print_pages(struct seq_file *m,
 			      struct binder_alloc *alloc);
-extern int binder_buffer_pool_create(void);
-extern void binder_buffer_pool_destroy(void);
 
 unsigned long
 binder_alloc_copy_user_to_buffer(struct binder_alloc *alloc,

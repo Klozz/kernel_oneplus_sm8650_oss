@@ -24,6 +24,7 @@
  * relative utilization, all CPUs are kept at their lowest P-state necessary to
  * satisfy the overall load at any given moment.
  */
+#include <linux/string.h>
 
 struct cass_cpu_cand {
 	int cpu;
@@ -35,6 +36,7 @@ struct cass_cpu_cand {
 	unsigned long cap_max;
 	unsigned long cap_no_therm;
 	unsigned long cap_orig;
+	unsigned long therm;
 	unsigned long eff_util;
 	unsigned long hard_util;
 	unsigned long util;
@@ -45,6 +47,7 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 {
 	struct rq *rq = cpu_rq(c->cpu);
 	struct cfs_rq *cfs_rq = &rq->cfs;
+	unsigned long hard_util;
 	unsigned long est;
 
 	/* Get this CPU's utilization from CFS tasks */
@@ -66,7 +69,8 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 		c->util -= min(c->util, task_util(current));
 
 	/* Get the utilization of everything other than CFS tasks */
-	c->hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
+	hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
+	c->hard_util = hard_util;
 
 	/*
 	 * Account for lost capacity due to time spent in RT/DL tasks and IRQs.
@@ -74,10 +78,10 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	 * order to produce consistently balanced task placement results between
 	 * CFS and RT tasks when CASS selects a CPU for them.
 	 */
-	c->cap = c->cap_max - min(c->hard_util, c->cap_max - 1);
+	c->cap = c->cap_max - min(hard_util, c->cap_max - 1);
 
 	/* Get the current capacity with thermal pressure excluded */
-	c->cap_no_therm = c->cap_orig - min(c->hard_util, c->cap_orig - 1);
+	c->cap_no_therm = c->cap_orig - min(hard_util, c->cap_orig - 1);
 }
 
 /*
@@ -99,26 +103,45 @@ bool cass_prime_cpu(const struct cass_cpu_cand *c)
 static __always_inline
 bool cass_cpu_better(const struct cass_cpu_cand *a,
 		     const struct cass_cpu_cand *b, unsigned long p_util,
-		     int this_cpu, int prev_cpu, bool sync, bool rt)
+		     unsigned long uc_min, int this_cpu, int prev_cpu, bool sync,
+		     bool rt, bool prefer_idle)
 {
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
 	long res;
+	bool a_prime = cass_prime_cpu(a);
+	bool b_prime = cass_prime_cpu(b);
+	const struct cass_cpu_cand *non_prime;
+	unsigned long margin, hyst;
 
 	/* Prefer the CPU that's not overloaded */
-	if (cass_cmp(b->eff_util / b->cap_max, a->eff_util / a->cap_max))
-		goto done;
-
-	/* Prefer the CPU that's less overloaded if they're both overloaded */
-	if (b->eff_util > b->cap_max && a->eff_util > a->cap_max &&
-	    cass_cmp(b->eff_util * SCHED_CAPACITY_SCALE / b->cap_max,
-		     a->eff_util * SCHED_CAPACITY_SCALE / a->cap_max))
+	if (cass_cmp(b->eff_util * a->cap_max, a->eff_util * b->cap_max))
 		goto done;
 
 	/* Prefer the CPU that fits the task */
 	if (cass_cmp(fits_capacity(p_util, a->cap_max),
 		     fits_capacity(p_util, b->cap_max)))
 		goto done;
+
+	/*
+	 * Prefer packing small, non-sync work on an active cpu over waking an idle
+	 * CPU, unless the active CPU is much worse.
+	 */
+	if (!prefer_idle && !!a->exit_lat != !!b->exit_lat) {
+		if (!a->exit_lat && b->exit_lat) {
+			if (a->eff_util <= a->cap_max &&
+			    a->util <= b->util + (SCHED_CAPACITY_SCALE / 16)) {
+				res = 1;
+				goto done;
+			}
+		} else if (a->exit_lat && !b->exit_lat) {
+			if (b->eff_util <= b->cap_max &&
+			    b->util <= a->util + (SCHED_CAPACITY_SCALE / 16)) {
+				res = -1;
+				goto done;
+			}
+		}
+	}
 
 	/* RT specific preferences */
 	if (rt) {
@@ -135,37 +158,80 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 			goto done;
 	}
 
-	/* Prefer the CPU that isn't the single fastest one in the system */
-	if (cass_cmp(cass_prime_cpu(b), cass_prime_cpu(a)))
-		goto done;
+	/*
+	 * Prefer the CPU that isn't the single fastest one in the system,
+	 * but only when the non-prime CPU can satisfy the task, including
+	 * uclamp inflation.
+	 */
+	if (a_prime != b_prime) {
+		non_prime = a_prime ? b : a;
+
+		if (non_prime->cap_max >= uc_min &&
+		    fits_capacity(p_util, non_prime->cap_max) &&
+		    cass_cmp(b_prime, a_prime))
+			goto done;
+	}
 
 	/* Prefer the CPU with lower relative utilization */
 	if (cass_cmp(b->util, a->util))
 		goto done;
+	/*
+	 * On shared llc systems (dsu/dynamiq) we can't reliably differentiate shared cache
+	 * with prev_cpu. Retain locality by making prev_cpu stickier when close.
+	 */
+	if (a->cpu != prev_cpu && b->cpu == prev_cpu) {
+		hyst = SCHED_CAPACITY_SCALE / 32; /* ~3% */
 
-	/* Prefer the CPU that is idle (only relevant for uclamped tasks) */
-	if (cass_cmp(!!a->exit_lat, !!b->exit_lat))
-		goto done;
+		/*
+		 * If prev_cpu fits and isn't overloaded, require enough util advantage
+		 * to move away from it.
+		 */
+		if (fits_capacity(p_util, b->cap_max) &&
+			b->eff_util <= b->cap_max &&
+			a->util <= b->util + hyst) {
+			res = -1;
+			goto done;
+		}
+	}
 
-	/* Prefer the current CPU for sync wakes */
-	if (sync && (cass_eq(a->cpu, this_cpu) || !cass_cmp(b->cpu, this_cpu)))
-		goto done;
+	/*
+	 * Prefer the current CPU for sync wakes, but only if it isn't
+	 * substantially more overloaded than the alternative.
+	 */
+	if (sync) {
+		margin = SCHED_CAPACITY_SCALE / 20; /* 5% */
+
+		if (a->cpu == this_cpu) {
+			if (a->eff_util <= a->cap_max &&
+			    a->util <= b->util + margin &&
+			    cass_eq(a->cpu, this_cpu))
+				goto done;
+		} else if (b->cpu == this_cpu) {
+			if (b->eff_util <= b->cap_max &&
+			    b->util <= a->util + margin &&
+			    !cass_cmp(b->cpu, this_cpu))
+				goto done;
+		}
+	}
 
 	/* Prefer the CPU with higher capacity */
 	if (cass_cmp(a->cap, b->cap))
+		goto done;
+
+	/* Prefer the CPU that is idle */
+	if (cass_cmp(!!a->exit_lat, !!b->exit_lat))
 		goto done;
 
 	/* Prefer the CPU with lower idle exit latency */
 	if (cass_cmp(b->exit_lat, a->exit_lat))
 		goto done;
 
-	/* Prefer the previous CPU */
-	if (cass_eq(a->cpu, prev_cpu) || !cass_cmp(b->cpu, prev_cpu))
+	/* Prefer the CPU with less thermal pressure */
+	if (cass_cmp(b->therm, a->therm))
 		goto done;
 
-	/* Prefer the CPU that shares a cache with the previous CPU */
-	if (cass_cmp(cpus_share_cache(a->cpu, prev_cpu),
-		     cpus_share_cache(b->cpu, prev_cpu)))
+	/* Prefer the previous CPU */
+	if (cass_eq(a->cpu, prev_cpu) || !cass_cmp(b->cpu, prev_cpu))
 		goto done;
 
 	/* @a isn't a better CPU than @b. @res must be <=0 to indicate such. */
@@ -181,7 +247,10 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	int this_cpu = raw_smp_processor_id();
 	unsigned long p_util, uc_min;
 	bool has_idle = false;
+	bool prefer_idle;
 	int cidx = 0, cpu;
+
+	memset(cands, 0, sizeof(cands));
 
 	/*
 	 * Get the utilization and uclamp minimum threshold for this task. Note
@@ -189,6 +258,12 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	 */
 	p_util = rt ? 0 : task_util_est(p);
 	uc_min = uclamp_eff_value(p, UCLAMP_MIN);
+
+	/*
+	 * Prefer idle CPUs for sync wakes and for "heavy enough" work; otherwise,
+	 * prefer packing onto an already-active CPU.
+	 */
+	prefer_idle = sync || rt || uc_min || p_util >= (SCHED_CAPACITY_SCALE / 8);
 
 	/*
 	 * Find the best CPU to wake @p on. Although idle_get_state() requires
@@ -206,6 +281,10 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		struct cass_cpu_cand *curr = &cands[cidx];
 		struct cpuidle_state *idle_state;
 		struct rq *rq = cpu_rq(cpu);
+		unsigned long therm;
+
+		/* Initialize early so @best->cpu is never garbage */
+		curr->cpu = cpu;
 
 		/* Bias RT placement */
 		if (rt) {
@@ -219,10 +298,12 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		curr->cap_orig = arch_scale_cpu_capacity(cpu);
 
 		/* Get the _current_, throttled maximum capacity of this CPU */
-		curr->cap_max = curr->cap_orig - thermal_load_avg(rq);
+		therm = thermal_load_avg(rq);
+		curr->cap_max = curr->cap_orig - therm;
+		curr->therm = therm;
 
 		/* Prefer the CPU that more closely meets the uclamp minimum */
-		if (curr->cap_max < uc_min && curr->cap_max < best->cap_max)
+		if (curr->cap_max < uc_min && best->cap_max >= uc_min)
 			continue;
 
 		/*
@@ -230,7 +311,6 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * sync wakes, treat the current CPU as idle if @current is the
 		 * only running task.
 		 */
-		curr->cpu = cpu;
 		if ((sync && cpu == this_cpu && rq->nr_running == 1) ||
 		    available_idle_cpu(cpu) || sched_idle_cpu(cpu)) {
 			/*
@@ -240,7 +320,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			 * found so far is the prime CPU. Otherwise, prefer idle
 			 * candidates.
 			 */
-			if (!has_idle &&
+			if (!has_idle && prefer_idle &&
 			    uc_min <= arch_scale_min_freq_capacity(cpu) &&
 			    !cass_prime_cpu(curr)) {
 				/* Discard any previous non-idle candidate */
@@ -257,7 +337,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 				curr->exit_lat += idle_state->exit_latency;
 		} else {
 			/* Skip non-idle CPUs if there's an idle candidate */
-			if (has_idle)
+			if (has_idle && prefer_idle)
 				continue;
 
 			/* Zero exit latency indicates this CPU isn't idle */
@@ -310,10 +390,33 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * cidx still needs to be changed to the other candidate slot.
 		 */
 		if (best == curr ||
-		    cass_cpu_better(curr, best, p_util, this_cpu, prev_cpu,
-				    sync, rt)) {
+			cass_cpu_better(curr, best, p_util, uc_min, this_cpu, prev_cpu,
+				    sync, rt, prefer_idle)) {
 			best = curr;
 			cidx ^= 1;
+			/*
+			 * Early-exit when we land on an idle, cache-affined CPU that
+			 * cleanly fits the task and isn't overloaded.
+			 */
+			if (best->exit_lat &&
+				best->cpu == prev_cpu &&
+				(best->cpu == prev_cpu || cpus_share_cache(best->cpu, prev_cpu)) &&
+				!cass_prime_cpu(best) &&
+				best->cap_max >= uc_min &&
+				fits_capacity(p_util, best->cap_max) &&
+				best->eff_util <= best->cap_max)
+				return best->cpu;
+			/*
+			 * Also early-exit for an obvious packed choice: non-idle, fits,
+			 * not overloaded, and prev_cpu.
+			*/
+			if (!best->exit_lat &&
+				best->cpu == prev_cpu &&
+				!cass_prime_cpu(best) &&
+				best->cap_max >= uc_min &&
+				fits_capacity(p_util, best->cap_max) &&
+				best->eff_util <= best->cap_max)
+				return best->cpu;
 		}
 	}
 

@@ -227,52 +227,10 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	return l_freq;
 }
 
-static inline unsigned long apply_dvfs_headroom(unsigned long util, int cpu)
-{
-	unsigned long capacity = capacity_orig_of(cpu);
-	unsigned long delta, headroom, max_boost, min_boost;
-
-	/* There's no need of headroom at high utilization. The same goes
-	 * for very low utilization as well. Consider 6.25% (capacity / 16)
-	 * as the minimum utilization required.
-	 */
-	if (unlikely(util >= capacity) || likely(util < (capacity >> 4)))
-		return util;
-
-	/*
-	 * Quadratically taper the boosting at the top end based on capacity
-	 * as these are expensive and we don't need that much of a big
-	 * headroom as we approach max capacity.
-	 *
-	 * Formula: (delta²) / (4 * capacity)
-	 */
-	delta = capacity - util;
-	headroom = (delta * delta) / (4 * capacity);
-
-        /* Limit the headroom within a valid range to avoid excessive or
-	 * negligible boosts.
-	 * Cap the maximum headroom at 10% (capacity / 10) to prevent
-	 * unnecessary over-boosting.
-	 * If the calculated headroom is below 0.39% (capacity / 256),
-	 * skip boosting as it is unlikely to trigger a frequency change.
-         */
-	max_boost = capacity / 10;
-	min_boost = capacity >> 8;
-
-	if (headroom > max_boost)
-		headroom = max_boost;
-	else if (headroom < min_boost)
-		return util;
-
-        return util + headroom;
-}
-
 unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
 				 unsigned long min,
 				 unsigned long max)
 {
-	/* Add dvfs headroom to actual utilization */
-	actual = apply_dvfs_headroom(actual, cpu);
 	/* Actually we don't need to target the max performance */
 	if (actual < max)
 		max = actual;

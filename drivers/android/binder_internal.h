@@ -489,12 +489,21 @@ struct binder_proc {
  * @lock:                    protects @proc->alloc fields
  * @delivered_freeze:        list of delivered freeze notification
  *                           (protected by @inner_lock)
+ * @mutex:                   protects binder_alloc fields
+ * @pages:                   array of struct page *
+ * @mapped:                  whether the vm area is mapped, each binderinstance
+ *                           is allowed a single mapping throughout its lifetime
  */
 struct binder_proc_wrap {
 	struct binder_proc proc;
 	struct dbitmap dmap;
 	spinlock_t lock;
 	struct list_head delivered_freeze;
+	struct binder_alloc_wrap {
+		struct mutex mutex;
+		struct page **pages;
+		bool mapped;
+	} alloc;
 };
 
 static inline
@@ -503,36 +512,14 @@ struct binder_proc_wrap *proc_wrapper(struct binder_proc *proc)
 	return container_of(proc, struct binder_proc_wrap, proc);
 }
 
-static inline struct binder_proc *
-binder_proc_entry(struct binder_alloc *alloc)
+static inline
+struct binder_alloc_wrap *alloc_to_wrap(struct binder_alloc *alloc)
 {
-	return container_of(alloc, struct binder_proc, alloc);
-}
+	struct binder_proc *proc;
 
-static inline struct binder_proc_wrap *
-binder_alloc_to_proc_wrap(struct binder_alloc *alloc)
-{
-	return proc_wrapper(binder_proc_entry(alloc));
-}
+	proc = container_of(alloc, struct binder_proc, alloc);
 
-static inline void binder_alloc_lock_init(struct binder_alloc *alloc)
-{
-	spin_lock_init(&binder_alloc_to_proc_wrap(alloc)->lock);
-}
-
-static inline void binder_alloc_lock(struct binder_alloc *alloc)
-{
-	spin_lock(&binder_alloc_to_proc_wrap(alloc)->lock);
-}
-
-static inline void binder_alloc_unlock(struct binder_alloc *alloc)
-{
-	spin_unlock(&binder_alloc_to_proc_wrap(alloc)->lock);
-}
-
-static inline int binder_alloc_trylock(struct binder_alloc *alloc)
-{
-	return spin_trylock(&binder_alloc_to_proc_wrap(alloc)->lock);
+	return &proc_wrapper(proc)->alloc;
 }
 
 /**
@@ -546,9 +533,9 @@ binder_alloc_get_free_async_space(struct binder_alloc *alloc)
 {
 	size_t free_async_space;
 
-	binder_alloc_lock(alloc);
+	mutex_lock(&alloc_to_wrap(alloc)->mutex);
 	free_async_space = alloc->free_async_space;
-	binder_alloc_unlock(alloc);
+	mutex_unlock(&alloc_to_wrap(alloc)->mutex);
 	return free_async_space;
 }
 

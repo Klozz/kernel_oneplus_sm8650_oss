@@ -125,6 +125,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_blocked);
 #endif
 
 DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+DEFINE_PER_CPU(struct rnd_state, sched_rnd_state);
 EXPORT_SYMBOL_GPL(runqueues);
 
 #ifdef CONFIG_SCHED_DEBUG
@@ -3707,14 +3708,16 @@ EXPORT_SYMBOL_GPL(select_fallback_rq);
  * The caller (fork, wakeup) owns p->pi_lock, ->cpus_ptr is stable.
  */
 static inline
-int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
 {
 	lockdep_assert_held(&p->pi_lock);
 
-	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
-		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
-	else
+	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
+		cpu = p->sched_class->select_task_rq(p, cpu, *wake_flags);
+		*wake_flags |= WF_RQ_SELECTED;
+	} else {
 		cpu = cpumask_any(p->cpus_ptr);
+	}
 
 	/*
 	 * In order not to call set_task_cpu() on a blocking task we need
@@ -3855,6 +3858,8 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 		rq->nr_uninterruptible--;
 
 #ifdef CONFIG_SMP
+	if (wake_flags & WF_RQ_SELECTED)
+		en_flags |= ENQUEUE_RQ_SELECTED;
 	if (wake_flags & WF_MIGRATED)
 		en_flags |= ENQUEUE_MIGRATED;
 	else
@@ -4302,6 +4307,8 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	guard(preempt)();
 	int cpu, success = 0;
 
+	wake_flags |= WF_TTWU;
+
 	if (p == current) {
 		/*
 		 * We're waking current, this means 'p->on_rq' and 'task_cpu(p)
@@ -4439,7 +4446,7 @@ int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 
 		trace_android_rvh_try_to_wake_up(p);
 
-		cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
+		cpu = select_task_rq(p, p->wake_cpu, &wake_flags);
 		if (task_cpu(p) != cpu) {
 			if (p->in_iowait) {
 				delayacct_blkio_end(p);
@@ -4961,6 +4968,7 @@ void wake_up_new_task(struct task_struct *p)
 {
 	struct rq_flags rf;
 	struct rq *rq;
+	int wake_flags = WF_FORK;
 
 	trace_android_rvh_wake_up_new_task(p);
 
@@ -4977,7 +4985,7 @@ void wake_up_new_task(struct task_struct *p)
 	 */
 	p->recent_used_cpu = task_cpu(p);
 	rseq_migrate(p);
-	__set_task_cpu(p, select_task_rq(p, task_cpu(p), WF_FORK));
+	__set_task_cpu(p, select_task_rq(p, task_cpu(p), &wake_flags));
 #endif
 	rq = __task_rq_lock(p, &rf);
 	update_rq_clock(rq);
@@ -4986,7 +4994,7 @@ void wake_up_new_task(struct task_struct *p)
 
 	activate_task(rq, p, ENQUEUE_NOCLOCK);
 	trace_sched_wakeup_new(p);
-	check_preempt_curr(rq, p, WF_FORK);
+	check_preempt_curr(rq, p, wake_flags);
 #ifdef CONFIG_SMP
 	if (p->sched_class->task_woken) {
 		/*
@@ -7306,14 +7314,11 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 
 	check_class_changed(rq, p, prev_class, oldprio);
 out_unlock:
-	/* Avoid rq from going away on us: */
-	preempt_disable();
+	/* Caller holds task_struct::pi_lock, IRQs are still disabled */
 
 	rq_unpin_lock(rq, &rf);
 	__balance_callbacks(rq);
 	raw_spin_rq_unlock(rq);
-
-	preempt_enable();
 }
 #else
 static inline int rt_effective_prio(struct task_struct *p, int prio)
@@ -10067,6 +10072,8 @@ int sched_cpu_dying(unsigned int cpu)
 void __init sched_init_smp(void)
 {
 	sched_init_numa(NUMA_NO_NODE);
+
+	prandom_init_once(&sched_rnd_state);
 
 	/*
 	 * There's no userspace yet to cause hotplug operations; hence all the
