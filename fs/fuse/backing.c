@@ -84,7 +84,7 @@ int fuse_open_backing(struct fuse_bpf_args *fa,
 	struct fuse_dentry *fd = get_fuse_dentry(file->f_path.dentry);
 	struct file *backing_file;
 
-	ff = fuse_file_alloc(fm, true);
+	ff = fuse_file_alloc(fm);
 	if (!ff)
 		return -ENOMEM;
 	file->private_data = ff;
@@ -185,7 +185,7 @@ static int fuse_open_file_backing(struct inode *inode, struct file *file)
 	struct fuse_file *fuse_file;
 	struct file *backing_file;
 
-	fuse_file = fuse_file_alloc(fm, true);
+	fuse_file = fuse_file_alloc(fm);
 	if (!fuse_file)
 		return -ENOMEM;
 	file->private_data = fuse_file;

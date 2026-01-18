@@ -55,7 +55,7 @@ struct fuse_release_args {
 	struct inode *inode;
 };
 
-struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release)
+struct fuse_file *fuse_file_alloc(struct fuse_mount *fm)
 {
 	struct fuse_file *ff;
 
@@ -64,13 +64,11 @@ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release)
 		return NULL;
 
 	ff->fm = fm;
-	if (release) {
-		ff->release_args = kzalloc(sizeof(*ff->release_args),
-					   GFP_KERNEL_ACCOUNT);
-		if (!ff->release_args) {
-			kfree(ff);
-			return NULL;
-		}
+	ff->release_args = kzalloc(sizeof(*ff->release_args),
+				   GFP_KERNEL_ACCOUNT);
+	if (!ff->release_args) {
+		kfree(ff);
+		return NULL;
 	}
 
 	INIT_LIST_HEAD(&ff->write_entry);
@@ -148,16 +146,15 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_file *ff;
 	int opcode = isdir ? FUSE_OPENDIR : FUSE_OPEN;
-	bool open = isdir ? !fc->no_opendir : !fc->no_open;
 
-	ff = fuse_file_alloc(fm, open);
+	ff = fuse_file_alloc(fm);
 	if (!ff)
 		return ERR_PTR(-ENOMEM);
 
 	ff->fh = 0;
 	/* Default for no-open */
 	ff->open_flags = FOPEN_KEEP_CACHE | (isdir ? FOPEN_CACHE_DIR : 0);
-	if (open) {
+	if (isdir ? !fc->no_opendir : !fc->no_open) {
 		struct fuse_open_out outarg;
 		int err;
 
@@ -170,9 +167,6 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 			fuse_file_free(ff);
 			return ERR_PTR(err);
 		} else {
-			/* No release needed */
-			kfree(ff->release_args);
-			ff->release_args = NULL;
 			if (isdir)
 				fc->no_opendir = 1;
 			else
@@ -308,7 +302,7 @@ out_inode_unlock:
 }
 
 static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
-				 unsigned int flags, int opcode, bool sync)
+				 unsigned int flags, int opcode)
 {
 	struct fuse_conn *fc = ff->fm->fc;
 	struct fuse_release_args *ra = ff->release_args;
@@ -326,9 +320,6 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 
 	wake_up_interruptible_all(&ff->poll_wait);
 
-	if (!ra)
-		return;
-
 	ra->inarg.fh = ff->fh;
 	ra->inarg.flags = flags;
 	ra->args.in_numargs = 1;
@@ -338,13 +329,6 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	ra->args.nodeid = ff->nodeid;
 	ra->args.force = true;
 	ra->args.nocreds = true;
-
-	/*
-	 * Hold inode until release is finished.
-	 * From fuse_sync_release() the refcount is 1 and everything's
-	 * synchronous, so we are fine with not doing igrab() here.
-	 */
-	ra->inode = sync ? NULL : igrab(&fi->inode);
 }
 
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
@@ -356,12 +340,14 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 
 	fuse_passthrough_release(&ff->passthrough);
 
-	fuse_prepare_release(fi, ff, open_flags, opcode, false);
+	fuse_prepare_release(fi, ff, open_flags, opcode);
 
-	if (ra && ff->flock) {
+	if (ff->flock) {
 		ra->inarg.release_flags |= FUSE_RELEASE_FLOCK_UNLOCK;
 		ra->inarg.lock_owner = fuse_lock_owner_id(ff->fm->fc, id);
 	}
+	/* Hold inode until release is finished */
+	ra->inode = igrab(inode);
 
 	/*
 	 * Normally this will send the RELEASE request, however if
@@ -371,12 +357,6 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 	 * Make the release synchronous if this is a fuseblk mount,
 	 * synchronous RELEASE is allowed (and desirable) in this case
 	 * because the server can be trusted not to screw up.
-	 *
-	 * Always use the asynchronous file put because the current thread
-	 * might be the fuse server.  This can happen if a process starts some
-	 * aio and closes the fd before the aio completes.  Since aio takes its
-	 * own ref to the file, the IO completion has to drop the ref, which is
-	 * how the fuse server can end up closing its clients' files.
 	 */
 	fuse_file_put(ra->inode, ff, ff->fm->fc->destroy);
 }
@@ -413,7 +393,7 @@ void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
 		       unsigned int flags)
 {
 	WARN_ON(refcount_read(&ff->count) > 1);
-	fuse_prepare_release(fi, ff, flags, FUSE_RELEASE, true);
+	fuse_prepare_release(fi, ff, flags, FUSE_RELEASE);
 	/*
 	 * iput(NULL) is a no-op and since the refcount is 1 and everything's
 	 * synchronous, we are fine with not doing igrab() here"

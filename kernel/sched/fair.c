@@ -5200,18 +5200,23 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 
 	if (cfs_rq->nr_queued == 1) {
 		check_enqueue_throttle(cfs_rq);
-		if (!throttled_hierarchy(cfs_rq)) {
-			list_add_leaf_cfs_rq(cfs_rq);
-		} else {
+		list_add_leaf_cfs_rq(cfs_rq);
 #ifdef CONFIG_CFS_BANDWIDTH
+		if (throttled_hierarchy(cfs_rq)) {
 			struct rq *rq = rq_of(cfs_rq);
 
 			if (cfs_rq_throttled(cfs_rq) && !cfs_rq->throttled_clock)
 				cfs_rq->throttled_clock = rq_clock(rq);
 			if (!cfs_rq->throttled_clock_self)
 				cfs_rq->throttled_clock_self = rq_clock(rq);
-#endif
+
+			if (cfs_rq->pelt_clock_throttled) {
+				cfs_rq->throttled_clock_pelt_time += rq_clock_pelt(rq) -
+					cfs_rq->throttled_clock_pelt;
+				cfs_rq->pelt_clock_throttled = 0;
+			}
 		}
+#endif
 	}
 }
 
@@ -5250,8 +5255,6 @@ static void set_delayed(struct sched_entity *se)
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
 		cfs_rq->h_nr_runnable--;
-		if (cfs_rq_throttled(cfs_rq))
-			break;
 	}
 }
 
@@ -5272,8 +5275,6 @@ static void clear_delayed(struct sched_entity *se)
 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
 
 		cfs_rq->h_nr_runnable++;
-		if (cfs_rq_throttled(cfs_rq))
-			break;
 	}
 }
 
@@ -5350,8 +5351,18 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	if (flags & DEQUEUE_DELAYED)
 		finish_delayed_dequeue_entity(se);
 
-	if (cfs_rq->nr_queued == 0)
+	if (cfs_rq->nr_queued == 0) {
 		update_idle_cfs_rq_clock_pelt(cfs_rq);
+#ifdef CONFIG_CFS_BANDWIDTH
+		if (throttled_hierarchy(cfs_rq)) {
+			struct rq *rq = rq_of(cfs_rq);
+
+			list_del_leaf_cfs_rq(cfs_rq);
+			cfs_rq->throttled_clock_pelt = rq_clock_pelt(rq);
+			cfs_rq->pelt_clock_throttled = 1;
+		}
+#endif
+	}
 
 	return true;
 }
@@ -5652,31 +5663,182 @@ static inline int throttled_lb_pair(struct task_group *tg,
 	       throttled_hierarchy(dest_cfs_rq);
 }
 
+static inline bool task_is_throttled(struct task_struct *p)
+{
+	return cfs_bandwidth_used() && p->throttled;
+}
+
+static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags);
+static void throttle_cfs_rq_work(struct callback_head *work)
+{
+	struct task_struct *p = container_of(work, struct task_struct, sched_throttle_work);
+	struct sched_entity *se;
+	struct cfs_rq *cfs_rq;
+	struct rq *rq;
+
+	WARN_ON_ONCE(p != current);
+	p->sched_throttle_work.next = &p->sched_throttle_work;
+
+	/*
+	 * If task is exiting, then there won't be a return to userspace, so we
+	 * don't have to bother with any of this.
+	 */
+	if ((p->flags & PF_EXITING))
+		return;
+
+	scoped_guard(task_rq_lock, p) {
+		se = &p->se;
+		cfs_rq = cfs_rq_of(se);
+
+		/* Raced, forget */
+		if (p->sched_class != &fair_sched_class)
+			return;
+
+		/*
+		 * If not in limbo, then either replenish has happened or this
+		 * task got migrated out of the throttled cfs_rq, move along.
+		 */
+		if (!cfs_rq->throttle_count)
+			return;
+		rq = scope.rq;
+		update_rq_clock(rq);
+		WARN_ON_ONCE(p->throttled || !list_empty(&p->throttle_node));
+		dequeue_task_fair(rq, p, DEQUEUE_SLEEP | DEQUEUE_SPECIAL);
+		list_add(&p->throttle_node, &cfs_rq->throttled_limbo_list);
+		/*
+		 * Must not set throttled before dequeue or dequeue will
+		 * mistakenly regard this task as an already throttled one.
+		 */
+		p->throttled = true;
+		resched_curr(rq);
+	}
+}
+
+void init_cfs_throttle_work(struct task_struct *p)
+{
+	init_task_work(&p->sched_throttle_work, throttle_cfs_rq_work);
+	/* Protect against double add, see throttle_cfs_rq() and throttle_cfs_rq_work() */
+	p->sched_throttle_work.next = &p->sched_throttle_work;
+	INIT_LIST_HEAD(&p->throttle_node);
+}
+
+/*
+ * Task is throttled and someone wants to dequeue it again:
+ * it could be sched/core when core needs to do things like
+ * task affinity change, task group change, task sched class
+ * change etc. and in these cases, DEQUEUE_SLEEP is not set;
+ * or the task is blocked after throttled due to freezer etc.
+ * and in these cases, DEQUEUE_SLEEP is set.
+ */
+static void detach_task_cfs_rq(struct task_struct *p);
+static void dequeue_throttled_task(struct task_struct *p, int flags)
+{
+	WARN_ON_ONCE(p->se.on_rq);
+	list_del_init(&p->throttle_node);
+
+	/* task blocked after throttled */
+	if (flags & DEQUEUE_SLEEP) {
+		p->throttled = false;
+		return;
+	}
+
+	/*
+	 * task is migrating off its old cfs_rq, detach
+	 * the task's load from its old cfs_rq.
+	 */
+	if (task_on_rq_migrating(p))
+		detach_task_cfs_rq(p);
+}
+
+static bool enqueue_throttled_task(struct task_struct *p)
+{
+	struct cfs_rq *cfs_rq = cfs_rq_of(&p->se);
+
+	/* @p should have gone through dequeue_throttled_task() first */
+	WARN_ON_ONCE(!list_empty(&p->throttle_node));
+
+	/*
+	 * If the throttled task @p is enqueued to a throttled cfs_rq,
+	 * take the fast path by directly putting the task on the
+	 * target cfs_rq's limbo list.
+	 *
+	 * Do not do that when @p is current because the following race can
+	 * cause @p's group_node to be incorectly re-insterted in its rq's
+	 * cfs_tasks list, despite being throttled:
+	 *
+	 *     cpuX                       cpuY
+	 *   p ret2user
+	 *  throttle_cfs_rq_work()  sched_move_task(p)
+	 *  LOCK task_rq_lock
+	 *  dequeue_task_fair(p)
+	 *  UNLOCK task_rq_lock
+	 *                          LOCK task_rq_lock
+	 *                          task_current_donor(p) == true
+	 *                          task_on_rq_queued(p) == true
+	 *                          dequeue_task(p)
+	 *                          put_prev_task(p)
+	 *                          sched_change_group()
+	 *                          enqueue_task(p) -> p's new cfs_rq
+	 *                                             is throttled, go
+	 *                                             fast path and skip
+	 *                                             actual enqueue
+	 *                          set_next_task(p)
+	 *                    list_move(&se->group_node, &rq->cfs_tasks); // bug
+	 *  schedule()
+	 *
+	 * In the above race case, @p current cfs_rq is in the same rq as
+	 * its previous cfs_rq because sched_move_task() only moves a task
+	 * to a different group from the same rq, so we can use its current
+	 * cfs_rq to derive rq and test if the task is current.
+	 */
+	if (throttled_hierarchy(cfs_rq) &&
+	    !task_current_donor(rq_of(cfs_rq), p)) {
+		list_add(&p->throttle_node, &cfs_rq->throttled_limbo_list);
+		return true;
+	}
+
+	/* we can't take the fast path, do an actual enqueue*/
+	p->throttled = false;
+	return false;
+}
+
+static void enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags);
 static int tg_unthrottle_up(struct task_group *tg, void *data)
 {
 	struct rq *rq = data;
 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+	struct task_struct *p, *tmp;
 
-	cfs_rq->throttle_count--;
-	if (!cfs_rq->throttle_count) {
+	if (--cfs_rq->throttle_count)
+		return 0;
+
+	if (cfs_rq->pelt_clock_throttled) {
 		cfs_rq->throttled_clock_pelt_time += rq_clock_pelt(rq) -
 					     cfs_rq->throttled_clock_pelt;
-
-		/* Add cfs_rq with load or one or more already running entities to the list */
-		if (!cfs_rq_is_decayed(cfs_rq))
-			list_add_leaf_cfs_rq(cfs_rq);
-
-		if (cfs_rq->throttled_clock_self) {
-			u64 delta = rq_clock(rq) - cfs_rq->throttled_clock_self;
-
-			cfs_rq->throttled_clock_self = 0;
-
-			if (SCHED_WARN_ON((s64)delta < 0))
-				delta = 0;
-
-			cfs_rq->throttled_clock_self_time += delta;
-		}
+		cfs_rq->pelt_clock_throttled = 0;
 	}
+
+	if (cfs_rq->throttled_clock_self) {
+		u64 delta = rq_clock(rq) - cfs_rq->throttled_clock_self;
+
+		cfs_rq->throttled_clock_self = 0;
+
+		if (WARN_ON_ONCE((s64)delta < 0))
+			delta = 0;
+
+		cfs_rq->throttled_clock_self_time += delta;
+	}
+
+	/* Re-enqueue the tasks that have been throttled at this level. */
+	list_for_each_entry_safe(p, tmp, &cfs_rq->throttled_limbo_list, throttle_node) {
+		list_del_init(&p->throttle_node);
+		p->throttled = false;
+		enqueue_task_fair(rq_of(cfs_rq), p, ENQUEUE_WAKEUP);
+	}
+
+	/* Add cfs_rq with load or one or more already running entities to the list */
+	if (!cfs_rq_is_decayed(cfs_rq))
+		list_add_leaf_cfs_rq(cfs_rq);
 
 	return 0;
 }
@@ -5686,17 +5848,26 @@ static int tg_throttle_down(struct task_group *tg, void *data)
 	struct rq *rq = data;
 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
 
+	if (cfs_rq->throttle_count++)
+		return 0;
+
+
 	/* group is entering throttled state, stop time */
-	if (!cfs_rq->throttle_count) {
-		cfs_rq->throttled_clock_pelt = rq_clock_pelt(rq);
+	WARN_ON_ONCE(cfs_rq->throttled_clock_self);
+	if (cfs_rq->nr_queued)
+		cfs_rq->throttled_clock_self = rq_clock(rq);
+	else {
+		/*
+		 * For cfs_rqs that still have entities enqueued, PELT clock
+		 * stop happens at dequeue time when all entities are dequeued.
+		 */
 		list_del_leaf_cfs_rq(cfs_rq);
 
-		SCHED_WARN_ON(cfs_rq->throttled_clock_self);
-		if (cfs_rq->nr_running)
-			cfs_rq->throttled_clock_self = rq_clock(rq);
+		cfs_rq->throttled_clock_pelt = rq_clock_pelt(rq);
+		cfs_rq->pelt_clock_throttled = 1;
 	}
-	cfs_rq->throttle_count++;
 
+	WARN_ON_ONCE(!list_empty(&cfs_rq->throttled_limbo_list));
 	return 0;
 }
 
@@ -5704,8 +5875,7 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct rq *rq = rq_of(cfs_rq);
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
-	struct sched_entity *se;
-	long task_delta, runnable_delta, idle_delta, dequeue = 1;
+	int dequeue = 1;
 
 	raw_spin_lock(&cfs_b->lock);
 	/* This will start the period timer if necessary */
@@ -5728,69 +5898,11 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	if (!dequeue)
 		return false;  /* Throttle no longer required. */
 
-	se = cfs_rq->tg->se[cpu_of(rq_of(cfs_rq))];
-
 	/* freeze hierarchy runnable averages while throttled */
 	rcu_read_lock();
 	walk_tg_tree_from(cfs_rq->tg, tg_throttle_down, tg_nop, (void *)rq);
 	rcu_read_unlock();
 
-	task_delta = cfs_rq->h_nr_queued;
-	runnable_delta = cfs_rq->h_nr_runnable;
-	idle_delta = cfs_rq->h_nr_idle;
-	for_each_sched_entity(se) {
-		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
-		int flags;
-
-		/* throttled entity or throttle-on-deactivate */
-		if (!se->on_rq)
-			goto done;
-
-		/*
-		 * Abuse SPECIAL to avoid delayed dequeue in this instance.
-		 * This avoids teaching dequeue_entities() about throttled
-		 * entities and keeps things relatively simple.
-		 */
-		flags = DEQUEUE_SLEEP | DEQUEUE_SPECIAL;
-		if (se->sched_delayed)
-			flags |= DEQUEUE_DELAYED;
-		dequeue_entity(qcfs_rq, se, flags);
-
-		if (cfs_rq_is_idle(group_cfs_rq(se)))
-			idle_delta = cfs_rq->h_nr_queued;
-
-		qcfs_rq->h_nr_queued -= task_delta;
-		qcfs_rq->h_nr_runnable -= runnable_delta;
-		qcfs_rq->h_nr_idle -= idle_delta;
-
-		if (qcfs_rq->load.weight) {
-			/* Avoid re-evaluating load for this entity: */
-			se = parent_entity(se);
-			break;
-		}
-	}
-
-	for_each_sched_entity(se) {
-		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
-		/* throttled entity or throttle-on-deactivate */
-		if (!se->on_rq)
-			goto done;
-
-		update_load_avg(qcfs_rq, se, 0);
-		se_update_runnable(se);
-
-		if (cfs_rq_is_idle(group_cfs_rq(se)))
-			idle_delta = cfs_rq->h_nr_queued;
-
-		qcfs_rq->h_nr_queued -= task_delta;
-		qcfs_rq->h_nr_runnable -= runnable_delta;
-		qcfs_rq->h_nr_idle -= idle_delta;
-	}
-
-	/* At this point se is NULL and we are at root level*/
-	sub_nr_running(rq, task_delta);
-
-done:
 	/*
 	 * Note: distribution will already see us throttled via the
 	 * throttled-list.  rq->lock protects completion.
@@ -5804,10 +5916,19 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct rq *rq = rq_of(cfs_rq);
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
-	struct sched_entity *se;
-	long task_delta, runnable_delta, idle_delta;
+	struct sched_entity *se = cfs_rq->tg->se[cpu_of(rq)];
 
-	se = cfs_rq->tg->se[cpu_of(rq)];
+	/*
+	 * It's possible we are called with runtime_remaining < 0 due to things
+	 * like async unthrottled us with a positive runtime_remaining but other
+	 * still running entities consumed those runtime before we reached here.
+	 *
+	 * We can't unthrottle this cfs_rq without any runtime remaining because
+	 * any enqueue in tg_unthrottle_up() will immediately trigger a throttle,
+	 * which is not supposed to happen on unthrottle path.
+	 */
+	if (cfs_rq->runtime_enabled && cfs_rq->runtime_remaining <= 0)
+		return;
 
 	cfs_rq->throttled = 0;
 
@@ -5832,59 +5953,8 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 			if (list_add_leaf_cfs_rq(cfs_rq_of(se)))
 				break;
 		}
-		goto unthrottle_throttle;
 	}
 
-	task_delta = cfs_rq->h_nr_queued;
-	runnable_delta = cfs_rq->h_nr_runnable;
-	idle_delta = cfs_rq->h_nr_idle;
-	for_each_sched_entity(se) {
-		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
-
-		/* Handle any unfinished DELAY_DEQUEUE business first. */
-		if (se->sched_delayed) {
-			int flags = DEQUEUE_SLEEP | DEQUEUE_DELAYED;
-
-			dequeue_entity(qcfs_rq, se, flags);
-		} else if (se->on_rq)
-			break;
-
-		enqueue_entity(qcfs_rq, se, ENQUEUE_WAKEUP);
-
-		if (cfs_rq_is_idle(group_cfs_rq(se)))
-			idle_delta = cfs_rq->h_nr_queued;
-
-		qcfs_rq->h_nr_queued += task_delta;
-		qcfs_rq->h_nr_runnable += runnable_delta;
-		qcfs_rq->h_nr_idle += idle_delta;
-
-		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(qcfs_rq))
-			goto unthrottle_throttle;
-	}
-
-	for_each_sched_entity(se) {
-		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
-
-		update_load_avg(qcfs_rq, se, UPDATE_TG);
-		se_update_runnable(se);
-
-		if (cfs_rq_is_idle(group_cfs_rq(se)))
-			idle_delta = cfs_rq->h_nr_queued;
-
-		qcfs_rq->h_nr_queued += task_delta;
-		qcfs_rq->h_nr_runnable += runnable_delta;
-		qcfs_rq->h_nr_idle += idle_delta;
-
-		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(qcfs_rq))
-			goto unthrottle_throttle;
-	}
-
-	/* At this point se is NULL and we are at root level*/
-	add_nr_running(rq, task_delta);
-
-unthrottle_throttle:
 	assert_list_leaf_cfs_rq(rq);
 
 	/* Determine whether we need to wake up potentially idle CPU: */
@@ -6535,6 +6605,10 @@ static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq) { return false; }
 static void check_enqueue_throttle(struct cfs_rq *cfs_rq) {}
 static inline void sync_throttle(struct task_group *tg, int cpu) {}
 static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+static void task_throttle_setup_work(struct task_struct *p) {}
+static bool task_is_throttled(struct task_struct *p) { return false; }
+static void dequeue_throttled_task(struct task_struct *p, int flags) {}
+static bool enqueue_throttled_task(struct task_struct *p) { return false; }
 
 static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
 {
@@ -6733,6 +6807,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	int should_iowait_boost;
 	u64 slice = 0;
 
+	if (task_is_throttled(p) && enqueue_throttled_task(p))
+		return;
+
 	/*
 	 * The code below (indirectly) updates schedutil which looks at
 	 * the cfs_rq utilization to select a frequency.
@@ -6787,10 +6864,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		if (cfs_rq_is_idle(cfs_rq))
 			h_nr_idle = 1;
 
-		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(cfs_rq))
-			goto enqueue_throttle;
-
 		flags = ENQUEUE_WAKEUP;
 	}
 
@@ -6813,10 +6886,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 
 		if (cfs_rq_is_idle(cfs_rq))
 			h_nr_idle = 1;
-
-		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(cfs_rq))
-			goto enqueue_throttle;
 	}
 
 	/* At this point se is NULL and we are at root level*/
@@ -6839,7 +6908,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!task_new)
 		check_update_overutilized_status(rq);
 
-enqueue_throttle:
 	assert_list_leaf_cfs_rq(rq);
 
 	hrtick_update(rq);
@@ -6892,10 +6960,6 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 		if (cfs_rq_is_idle(cfs_rq))
 			h_nr_idle = 1;
 
-		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(cfs_rq))
-			return 0;
-
 		/* Don't dequeue parent if it has other entities besides us */
 		if (cfs_rq->load.weight) {
 			slice = cfs_rq_min_slice(cfs_rq);
@@ -6932,11 +6996,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
 		cfs_rq->h_nr_idle -= h_nr_idle;
 
 		if (cfs_rq_is_idle(cfs_rq))
-			h_nr_idle = 1;
-
-		/* end evaluation on encountering a throttled cfs_rq */
-		if (cfs_rq_throttled(cfs_rq))
-			return 0;
+			h_nr_idle = h_nr_queued;
 	}
 
 	sub_nr_running(rq, h_nr_queued);
@@ -6970,6 +7030,11 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	if (task_is_throttled(p)) {
+		dequeue_throttled_task(p, flags);
+		return true;
+	}
+
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
@@ -8648,19 +8713,22 @@ static struct task_struct *pick_task_fair(struct rq *rq)
 {
 	struct sched_entity *se;
 	struct cfs_rq *cfs_rq;
+	struct task_struct *p;
+	bool throttled;
 
 again:
 	cfs_rq = &rq->cfs;
 	if (!cfs_rq->nr_queued)
 		return NULL;
 
+	throttled = false;
+
 	do {
 		/* Might not have done put_prev_entity() */
 		if (cfs_rq->curr && cfs_rq->curr->on_rq)
 			update_curr(cfs_rq);
 
-		if (unlikely(check_cfs_rq_runtime(cfs_rq)))
-			goto again;
+		throttled |= check_cfs_rq_runtime(cfs_rq);
 
 		se = pick_next_entity(rq, cfs_rq);
 		if (!se)
@@ -8668,7 +8736,10 @@ again:
 		cfs_rq = group_cfs_rq(se);
 	} while (cfs_rq);
 
-	return task_of(se);
+	p = task_of(se);
+	if (unlikely(throttled))
+		task_throttle_setup_work(p);
+	return p;
 }
 
 struct task_struct *
@@ -9727,15 +9798,11 @@ static unsigned long task_h_load(struct task_struct *p)
 }
 #endif
 
-static void update_blocked_averages(int cpu)
+static void __update_blocked_averages(struct rq *rq)
 {
 	bool decayed = false, done = true;
-	struct rq *rq = cpu_rq(cpu);
-	struct rq_flags rf;
 
-	rq_lock_irqsave(rq, &rf);
 	update_blocked_load_tick(rq);
-	update_rq_clock(rq);
 
 	decayed |= __update_blocked_others(rq, &done);
 	decayed |= __update_blocked_fair(rq, &done);
@@ -9743,6 +9810,16 @@ static void update_blocked_averages(int cpu)
 	update_blocked_load_status(rq, !done);
 	if (decayed)
 		cpufreq_update_util(rq, 0);
+}
+
+static void update_blocked_averages(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct rq_flags rf;
+
+	rq_lock_irqsave(rq, &rf);
+	update_rq_clock(rq);
+	__update_blocked_averages(rq);
 	rq_unlock_irqrestore(rq, &rf);
 }
 
@@ -12637,10 +12714,15 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	}
 	rcu_read_unlock();
 
-	raw_spin_rq_unlock(this_rq);
-
+	/*
+	 * Include sched_balance_update_blocked_averages() in the cost
+	 * calculation because it can be quite costly -- this ensures we skip
+	 * it when avg_idle gets to be very low.
+	 */
 	t0 = sched_clock_cpu(this_cpu);
-	update_blocked_averages(this_cpu);
+	__update_blocked_averages(this_rq);
+
+	raw_spin_rq_unlock(this_rq);
 
 	rcu_read_lock();
 	for_each_domain(this_cpu, sd) {
@@ -12825,7 +12907,188 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr)
 }
 
 /*
- * se_fi_update - Update the cfs_rq->zero_vruntime_fi in a CFS hierarchy if needed.
+ * Consider any infeasible weight scenario. Take for instance two tasks,
+ * each bound to their respective sibling, one with weight 1 and one with
+ * weight 2. Then the lower weight task will run ahead of the higher weight
+ * task without bound.
+ *
+ * This utterly destroys the concept of a shared time base.
+ *
+ * Remember; all this is about a proportionally fair scheduling, where each
+ * tasks receives:
+ *
+ *              w_i
+ *   dt_i = ---------- dt                                     (1)
+ *          \Sum_j w_j
+ *
+ * which we do by tracking a virtual time, s_i:
+ *
+ *          1
+ *   s_i = --- d[t]_i                                         (2)
+ *         w_i
+ *
+ * Where d[t] is a delta of discrete time, while dt is an infinitesimal.
+ * The immediate corollary is that the ideal schedule S, where (2) to use
+ * an infinitesimal delta, is:
+ *
+ *           1
+ *   S = ---------- dt                                        (3)
+ *       \Sum_i w_i
+ *
+ * From which we can define the lag, or deviation from the ideal, as:
+ *
+ *   lag(i) = S - s_i                                         (4)
+ *
+ * And since the one and only purpose is to approximate S, we get that:
+ *
+ *   \Sum_i w_i lag(i) := 0                                   (5)
+ *
+ * If this were not so, we no longer converge to S, and we can no longer
+ * claim our scheduler has any of the properties we derive from S. This is
+ * exactly what you did above, you broke it!
+ *
+ *
+ * Let's continue for a while though; to see if there is anything useful to
+ * be learned. We can combine (1)-(3) or (4)-(5) and express S in s_i:
+ *
+ *       \Sum_i w_i s_i
+ *   S = --------------                                       (6)
+ *         \Sum_i w_i
+ *
+ * Which gives us a way to compute S, given our s_i. Now, if you've read
+ * our code, you know that we do not in fact do this, the reason for this
+ * is two-fold. Firstly, computing S in that way requires a 64bit division
+ * for every time we'd use it (see 12), and secondly, this only describes
+ * the steady-state, it doesn't handle dynamics.
+ *
+ * Anyway, in (6):  s_i -> x + (s_i - x), to get:
+ *
+ *           \Sum_i w_i (s_i - x)
+ *   S - x = --------------------                             (7)
+ *              \Sum_i w_i
+ *
+ * Which shows that S and s_i transform alike (which makes perfect sense
+ * given that S is basically the (weighted) average of s_i).
+ *
+ * Then:
+ *
+ *   x -> s_min := min{s_i}                                   (8)
+ *
+ * to obtain:
+ *
+ *               \Sum_i w_i (s_i - s_min)
+ *   S = s_min + ------------------------                     (9)
+ *                     \Sum_i w_i
+ *
+ * Which already looks familiar, and is the basis for our current
+ * approximation:
+ *
+ *   S ~= s_min                                              (10)
+ *
+ * Now, obviously, (10) is absolute crap :-), but it sorta works.
+ *
+ * So the thing to remember is that the above is strictly UP. It is
+ * possible to generalize to multiple runqueues -- however it gets really
+ * yuck when you have to add affinity support, as illustrated by our very
+ * first counter-example.
+ *
+ * Luckily I think we can avoid needing a full multi-queue variant for
+ * core-scheduling (or load-balancing). The crucial observation is that we
+ * only actually need this comparison in the presence of forced-idle; only
+ * then do we need to tell if the stalled rq has higher priority over the
+ * other.
+ *
+ * [XXX assumes SMT2; better consider the more general case, I suspect
+ * it'll work out because our comparison is always between 2 rqs and the
+ * answer is only interesting if one of them is forced-idle]
+ *
+ * And (under assumption of SMT2) when there is forced-idle, there is only
+ * a single queue, so everything works like normal.
+ *
+ * Let, for our runqueue 'k':
+ *
+ *   T_k = \Sum_i w_i s_i
+ *   W_k = \Sum_i w_i      ; for all i of k                  (11)
+ *
+ * Then we can write (6) like:
+ *
+ *         T_k
+ *   S_k = ---                                               (12)
+ *         W_k
+ *
+ * From which immediately follows that:
+ *
+ *           T_k + T_l
+ *   S_k+l = ---------                                       (13)
+ *           W_k + W_l
+ *
+ * On which we can define a combined lag:
+ *
+ *   lag_k+l(i) := S_k+l - s_i                               (14)
+ *
+ * And that gives us the tools to compare tasks across a combined runqueue.
+ *
+ *
+ * Combined this gives the following:
+ *
+ *  a) when a runqueue enters force-idle, sync it against it's sibling rq(s)
+ *     using (7); this only requires storing single 'time'-stamps.
+ *
+ *  b) when comparing tasks between 2 runqueues of which one is forced-idle,
+ *     compare the combined lag, per (14).
+ *
+ * Now, of course cgroups (I so hate them) make this more interesting in
+ * that a) seems to suggest we need to iterate all cgroup on a CPU at such
+ * boundaries, but I think we can avoid that. The force-idle is for the
+ * whole CPU, all it's rqs. So we can mark it in the root and lazily
+ * propagate downward on demand.
+ */
+
+/*
+ * So this sync is basically a relative reset of S to 0.
+ *
+ * So with 2 queues, when one goes idle, we drop them both to 0 and one
+ * then increases due to not being idle, and the idle one builds up lag to
+ * get re-elected. So far so simple, right?
+ *
+ * When there's 3, we can have the situation where 2 run and one is idle,
+ * we sync to 0 and let the idle one build up lag to get re-election. Now
+ * suppose another one also drops idle. At this point dropping all to 0
+ * again would destroy the built-up lag from the queue that was already
+ * idle, not good.
+ *
+ * So instead of syncing everything, we can:
+ *
+ *   less := !((s64)(s_a - s_b) <= 0)
+ *
+ *   (v_a - S_a) - (v_b - S_b) == v_a - v_b - S_a + S_b
+ *                             == v_a - (v_b - S_a + S_b)
+ *
+ * IOW, we can recast the (lag) comparison to a one-sided difference.
+ * So if then, instead of syncing the whole queue, sync the idle queue
+ * against the active queue with S_a + S_b at the point where we sync.
+ *
+ * (XXX consider the implication of living in a cyclic group: N / 2^n N)
+ *
+ * This gives us means of syncing single queues against the active queue,
+ * and for already idle queues to preserve their build-up lag.
+ *
+ * Of course, then we get the situation where there's 2 active and one
+ * going idle, who do we pick to sync against? Theory would have us sync
+ * against the combined S, but as we've already demonstrated, there is no
+ * such thing in infeasible weight scenarios.
+ *
+ * One thing I've considered; and this is where that core_active rudiment
+ * came from, is having active queues sync up between themselves after
+ * every tick. This limits the observed divergence due to the work
+ * conservancy.
+ *
+ * On top of that, we can improve upon things by moving away from our
+ * horrible (10) hack and moving to (9) and employing (13) here.
+ */
+
+/*
+ * se_fi_update - Update the cfs_rq->min_vruntime_fi in a CFS hierarchy if needed.
  */
 static void se_fi_update(struct sched_entity *se, unsigned int fi_seq, bool forceidle)
 {
@@ -12930,6 +13193,12 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		entity_tick(cfs_rq, se, queued);
+	}
+
+	if (queued) {
+		if (!need_resched())
+			hrtick_start_fair(rq, curr);
+		return;
 	}
 
 	if (static_branch_unlikely(&sched_numa_balancing))

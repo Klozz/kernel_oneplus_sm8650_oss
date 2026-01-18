@@ -595,6 +595,11 @@ config OPLUS_VIBRATOR_GKI_ENABLE
 	  This option enables support for vibrator compatibility.
 #endif
 
+config PXLW_IRIS
+	tristate "Pixelworks support"
+	help
+	  This option enables support Pixelworks
+
 source "drivers/misc/rtimd-i2c/Kconfig"
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"

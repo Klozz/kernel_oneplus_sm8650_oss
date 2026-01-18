@@ -58,7 +58,7 @@
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
 #undef dev_dbg
-#define dev_dbg dev_err
+#define dev_dbg(dev, fmt, ...) do { } while (0)
 #endif
 #define CREATE_TRACE_POINTS
 #include <trace/events/qcom_haptics.h>
