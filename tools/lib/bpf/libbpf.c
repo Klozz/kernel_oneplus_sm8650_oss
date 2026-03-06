@@ -10747,24 +10747,32 @@ static int resolve_full_path(const char *file, char *result, size_t result_sz)
 
 		if (!search_paths[i])
 			continue;
-		for (s = search_paths[i]; s != NULL; s = strchr(s, ':')) {
+
+		s = search_paths[i];
+		while (s) {
 			char *next_path;
 			int seg_len;
 
 			if (s[0] == ':')
 				s++;
-			next_path = strchr(s, ':');
-			seg_len = next_path ? next_path - s : strlen(s);
-			if (!seg_len)
-				continue;
-			snprintf(result, result_sz, "%.*s/%s", seg_len, s, file);
-			/* ensure it has required permissions */
-			if (faccessat(AT_FDCWD, result, perm, AT_EACCESS) < 0)
-				continue;
-			pr_debug("resolved '%s' to '%s'\n", file, result);
-			return 0;
+
+			/* Cast to char * to avoid discarding const qualifier */
+			next_path = (char *)strchr(s, ':');
+			seg_len = next_path ? (int)(next_path - s) : (int)strlen(s);
+
+			if (seg_len > 0) {
+				snprintf(result, result_sz, "%.*s/%s", seg_len, s, file);
+				/* Check if file exists with required permissions */
+				if (faccessat(AT_FDCWD, result, perm, AT_EACCESS) == 0) {
+					pr_debug("resolved '%s' to '%s'\n", file, result);
+					return 0;
+				}
+			}
+			/* Move to the next segment */
+			s = next_path;
 		}
 	}
+
 	return -ENOENT;
 }
 
