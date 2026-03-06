@@ -60,6 +60,7 @@
 
 static uint32_t g_need_select_firmware_prjects[] = {
 	25861,
+	25863,
 };
 
 static char g_modem_firmware_name[][MAX_MODEM_FIRMWARE_NAME_SIZE] = {

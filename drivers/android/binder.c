@@ -781,7 +781,7 @@ static void binder_do_set_priority(struct binder_thread *thread,
 		attrs.sched_util_max = desired->uclamp[UCLAMP_MAX];
 	}
 
-	if (task->policy == policy && task->normal_prio == desired->prio
+	if (task->policy == policy && task->prio == desired->prio
 		&& is_uclamp_equal(task, desired)) {
 		spin_lock(&thread->prio_lock);
 		if (thread->prio_state == BINDER_PRIO_PENDING)
@@ -824,7 +824,7 @@ static void binder_do_set_priority(struct binder_thread *thread,
 			      task->pid, desired->prio,
 			      to_kernel_prio(policy, priority));
 
-	trace_binder_set_priority(task->tgid, task->pid, task->normal_prio,
+	trace_binder_set_priority(task->tgid, task->pid, task->prio,
 				  to_kernel_prio(policy, priority),
 				  desired->prio);
 
@@ -3555,7 +3555,7 @@ static void binder_transaction(struct binder_proc *proc,
 	    binder_supported_policy(current->policy)) {
 		/* Inherit supported policies for synchronous transactions */
 		t->priority.sched_policy = current->policy;
-		t->priority.prio = current->normal_prio;
+		t->priority.prio = current->prio;
 	} else {
 		/* Otherwise, fall back to the default priority */
 		t->priority = target_proc->default_priority;

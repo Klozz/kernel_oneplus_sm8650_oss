@@ -1130,9 +1130,6 @@ struct rq {
 	u64			idle_stamp;
 	u64			avg_idle;
 
-	unsigned long		wake_stamp;
-	u64			wake_avg_idle;
-
 	/* This is used to determine avg_idle's max value */
 	u64			max_idle_balance_cost;
 
@@ -1533,6 +1530,7 @@ static inline struct cfs_rq *group_cfs_rq(struct sched_entity *grp)
 }
 #endif
 
+extern void update_rq_avg_idle(struct rq *rq);
 extern void update_rq_clock(struct rq *rq);
 
 /*

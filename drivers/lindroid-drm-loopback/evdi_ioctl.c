@@ -19,6 +19,7 @@
 #include <linux/compat.h>
 #include <linux/sched/signal.h>
 #include <linux/errno.h>
+#include <linux/cpu_boost.h>
 
 static int evdi_queue_create_event_with_id(struct evdi_device *evdi, struct drm_evdi_gbm_create_buff *params, struct drm_file *owner, int poll_id);
 int evdi_queue_destroy_event(struct evdi_device *evdi, int id, struct drm_file *owner);
@@ -32,13 +33,17 @@ static inline int evdi_get_unused_fds_batch(int n, int flags, int *fds)
 {
 	int i, fd, ret = 0;
 
-	if (!fds || n <= 0)
+	prefetchw(fds);
+
+	if (unlikely(!fds || n <= 0))
 		return ret;
 
 	for (i = 0; i < n; i++)
 		fds[i] = -1;
 
 	for (i = 0; i < n; i++) {
+		if (i + 1 < n)
+			prefetchw(&fds[i+1]);
 		fd = get_unused_fd_flags(flags);
 		if (unlikely(fd < 0)) {
 			ret = fd;
@@ -61,10 +66,14 @@ static int evdi_process_gralloc_buffer(struct evdi_inflight_req *req,
 	if (!gralloc)
 		return -EINVAL;
 
+	if (unlikely(gralloc->numFds < 0 || gralloc->numFds > EVDI_MAX_FDS ||
+		     gralloc->numInts < 0 || gralloc->numInts > EVDI_MAX_INTS))
+		return -EINVAL;
+
 	gralloc_buf->version = gralloc->version;
 	gralloc_buf->numFds = gralloc->numFds;
 	gralloc_buf->numInts = gralloc->numInts;
-	if (gralloc->data_ints) {
+	if (gralloc_buf->numInts) {
 		memcpy(&gralloc_buf->data[gralloc_buf->numFds],
 		       gralloc->data_ints,
 		       sizeof(int) * gralloc_buf->numInts);
@@ -109,7 +118,6 @@ static int evdi_copy_to_user_allow_partial(void __user *dst, const void *src, si
 	if (!len)
 		return 0;
 
-	prefetch(src);
 	not = copy_to_user(dst, src, len);
 	if (not == len)
 		return -EFAULT;
@@ -330,102 +338,50 @@ void evdi_inflight_discard_owner(struct evdi_device *evdi, struct drm_file *owne
 #endif
 }
 
-static int evdi_queue_create_event_with_id(struct evdi_device *evdi,
-					   struct drm_evdi_gbm_create_buff *params,
-					   struct drm_file *owner,
-					   int poll_id)
+static inline size_t evdi_event_serialize_payload(struct evdi_event *e,
+						  void *out_buf,
+						  size_t out_buf_size)
 {
-	struct evdi_event *event;
-	void *data = NULL;
-	bool small = false;
+	size_t copy_size;
 
-	data = evdi_small_payload_alloc(GFP_ATOMIC);
-	if (data) {
-		small = true;
-	} else {
-		data = kmalloc(sizeof(*params), GFP_ATOMIC);
-		if (!data)
-			return -ENOMEM;
-	}
+	if (unlikely(!e || !out_buf || !out_buf_size))
+		return 0;
 
-	memcpy(data, params, sizeof(*params));
+	copy_size = min(e->payload_size, out_buf_size);
+	if (copy_size)
+		memcpy(out_buf, e->payload, copy_size);
 
-	event = evdi_event_alloc(evdi, create_buf,
-				 poll_id,
-				 data, sizeof(*params), false, owner);
-	if (!event) {
-		if (small)
-			evdi_small_payload_free(data);
-		else
-			kfree(data);
-
-		return -ENOMEM;
-	}
-	if (sizeof(*params) == 0) {
-		EVDI_PERF_INC64(&evdi_perf.event_payload_none_allocs);
-	} else if (small) {
-		EVDI_PERF_INC64(&evdi_perf.event_payload_small_allocs);
-	} else {
-		EVDI_PERF_INC64(&evdi_perf.event_payload_heap_allocs);
-	}
-	event->payload_type = small ? 1 : 2;
-
-	evdi_event_queue(evdi, event);
-	return 0;
+	return copy_size;
 }
 
-static int evdi_queue_struct_event_with_id(struct evdi_device *evdi,
-	void *params, size_t params_size,
-	enum poll_event_type type,
-	struct drm_file *owner,
-	int poll_id)
+static int evdi_queue_create_event_with_id(struct evdi_device *evdi,
+	   struct drm_evdi_gbm_create_buff *params,
+	   struct drm_file *owner,
+	   int poll_id)
 {
-	struct evdi_event *event;
-	void *data = NULL;
-	bool small = false;
-
-	if (params_size <= EVDI_SMALL_PAYLOAD_MAX) {
-		data = evdi_small_payload_alloc(GFP_ATOMIC);
-		if (data)
-			small = true;
-	}
-	if (!data) {
-		data = kmalloc(params_size, GFP_ATOMIC);
-		if (!data)
-			return -ENOMEM;
-	}
-
-	memcpy(data, params, params_size);
-
-	event = evdi_event_alloc(evdi, type, poll_id, data, params_size, false, owner);
-	if (!event) {
-		if (small)
-			evdi_small_payload_free(data);
-		else
-			kfree(data);
-
+	struct evdi_event *event = evdi_event_alloc(evdi, create_buf, poll_id,
+		(void *)params, sizeof(*params), owner);
+	if (!event)
 		return -ENOMEM;
-	}
-	if (sizeof(*params) == 0) {
-		EVDI_PERF_INC64(&evdi_perf.event_payload_none_allocs);
-	} else if (small) {
-		EVDI_PERF_INC64(&evdi_perf.event_payload_small_allocs);
-	} else {
-		EVDI_PERF_INC64(&evdi_perf.event_payload_heap_allocs);
-	}
-	event->payload_type = small ? 1 : 2;
 
 	evdi_event_queue(evdi, event);
 	return 0;
 }
 
 static int evdi_queue_get_buf_event_with_id(struct evdi_device *evdi,
-					    struct drm_evdi_gbm_get_buff *params,
-					    struct drm_file *owner,
-					    int poll_id)
+	struct drm_evdi_gbm_get_buff *params,
+	struct drm_file *owner,
+	int poll_id)
 {
-	return evdi_queue_struct_event_with_id(evdi, params, sizeof(*params),
-					       get_buf, owner, poll_id);
+	struct evdi_event *event;
+
+	event = evdi_event_alloc(evdi, get_buf, poll_id,
+		(void *)params, sizeof(*params), owner);
+	if (!event)
+		return -ENOMEM;
+
+	evdi_event_queue(evdi, event);
+	return 0;
 }
 
 static inline void evdi_flush_work(struct evdi_device *evdi)
@@ -503,45 +459,160 @@ int evdi_ioctl_connect(struct drm_device *dev, void *data, struct drm_file *file
 	return 0;
 }
 
+static __always_inline bool evdi_swap_mailbox_read_stable(struct evdi_device *evdi,
+							 int display_id,
+							 u64 *seq,
+							 u64 *payload,
+							 int *poll_id,
+							 struct drm_file **owner)
+{
+	struct evdi_swap_mailbox *mb;
+	u64 s1, s2, p;
+	int pid;
+	struct drm_file *o;
+	int tries = 0;
+
+	if (unlikely(!evdi))
+		return false;
+
+	if (unlikely(display_id < 0 || display_id >= LINDROID_MAX_CONNECTORS))
+		return false;
+
+	mb = &evdi->swap_mailbox[display_id];
+
+	for (;;) {
+		s1 = (u64)atomic64_read(&mb->seq);
+		if (s1 & 1)
+			goto retry;
+
+		evdi_smp_rmb();
+		p = (u64)atomic64_read(&mb->payload);
+		pid = atomic_read(&mb->poll_id);
+		o = READ_ONCE(mb->owner);
+		evdi_smp_rmb();
+
+		s2 = (u64)atomic64_read(&mb->seq);
+		if (likely(s1 == s2 && !(s2 & 1)))
+			break;
+
+retry:
+		if (++tries >= 8)
+			return false;
+		cpu_relax();
+	}
+
+	*seq = s2;
+	*payload = p;
+	*poll_id = pid;
+	*owner = o;
+	return true;
+}
+
+static __always_inline bool evdi_swap_dequeue_for_file(struct evdi_device *evdi,
+						       struct drm_file *file,
+						       struct evdi_swap *out,
+						       int *out_poll_id)
+{
+	struct evdi_file_priv *priv;
+	struct drm_file *owner;
+	int start, i, poll_id, d;
+	u64 seq, payload;
+
+	if (unlikely(!evdi || !file || !out || !out_poll_id))
+		return false;
+
+	priv = file->driver_priv;
+	if (unlikely(!priv))
+		return false;
+
+	start = (int)(priv->swap_rr % LINDROID_MAX_CONNECTORS);
+	for (i = 0; i < LINDROID_MAX_CONNECTORS; i++) {
+		d = (start + i) % LINDROID_MAX_CONNECTORS;
+
+		if (!evdi_swap_mailbox_read_stable(evdi, d, &seq, &payload, &poll_id, &owner))
+			continue;
+
+		if (owner != file)
+			continue;
+		if (seq == priv->last_swap_seq[d])
+			continue;
+
+		priv->last_swap_seq[d] = seq;
+		priv->swap_rr = (u8)((d + 1) % LINDROID_MAX_CONNECTORS);
+
+		out->id = (int)(u32)(payload >> 32);
+		out->display_id = (int)(u32)payload;
+		*out_poll_id = poll_id;
+		return true;
+	}
+
+	return false;
+}
+
 int evdi_ioctl_poll(struct drm_device *dev, void *data, struct drm_file *file)
 {
 	struct evdi_device *evdi = dev->dev_private;
 	struct drm_evdi_poll *cmd = data;
 	struct evdi_event *event;
-	int ret;
+	struct evdi_swap sw;
+	size_t payload_size;
+	int ret, poll_id;
+
+	u8 payload_buf[EVDI_EVENT_PAYLOAD_MAX];
 
 	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[1]);
 
-	event = evdi_event_dequeue(evdi);
-	if (likely(event)) {
-		cmd->event = event->type;
-		cmd->poll_id = event->poll_id;
-
-		if (event->data && cmd->data) {
-			if (evdi_copy_to_user_allow_partial(cmd->data, event->data, event->data_size)) {
-				evdi_event_free(event);
+	/* swap mailbox fast path */
+	if (evdi_swap_dequeue_for_file(evdi, file, &sw, &poll_id)) {
+		cmd->event = swap_to;
+		cmd->poll_id = poll_id;
+		if (cmd->data) {
+			if (evdi_copy_to_user_allow_partial(cmd->data, &sw, sizeof(sw)))
 				return -EFAULT;
-			}
 		}
-		evdi_event_free(event);
+		EVDI_PERF_INC64(&evdi_perf.swap_delivered);
 		return 0;
+	}
+
+	event = evdi_event_dequeue(evdi);
+	if (event) {
+		goto deliver;
 	}
 
 	ret = evdi_event_wait(evdi, file);
 	if (ret)
 		return ret;
 
+	/* Check mailbox again after wake */
+	if (evdi_swap_dequeue_for_file(evdi, file, &sw, &poll_id)) {
+		cmd->event = swap_to;
+		cmd->poll_id = poll_id;
+		if (cmd->data) {
+			if (evdi_copy_to_user_allow_partial(cmd->data, &sw, sizeof(sw)))
+				return -EFAULT;
+		}
+		EVDI_PERF_INC64(&evdi_perf.swap_delivered);
+		return 0;
+	}
+
 	event = evdi_event_dequeue(evdi);
 	if (!event)
 		return -EAGAIN;
 
+deliver:
 	cmd->event = event->type;
+	cpu_boost_kick(4);
 	cmd->poll_id = event->poll_id;
 
-	if (event->data && cmd->data) {
-		if (evdi_copy_to_user_allow_partial(cmd->data, event->data, event->data_size)) {
-			evdi_event_free(event);
-			return -EFAULT;
+	payload_size = evdi_event_serialize_payload(event,
+			payload_buf, sizeof(payload_buf));
+
+	if (payload_size && cmd->data) {
+		if (evdi_copy_to_user_allow_partial(cmd->data,
+						    payload_buf,
+						    payload_size)) {
+		evdi_event_free(event);
+		return -EFAULT;
 		}
 	}
 
@@ -560,7 +631,7 @@ int evdi_ioctl_gbm_get_buff(struct drm_device *dev, void *data, struct drm_file 
 	struct evdi_gralloc_data *gralloc;
 	int poll_id;
 	long ret;
-	int i, copy_size;
+	int i, nfd, copy_size;
 
 	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[7]);
 
@@ -612,8 +683,14 @@ int evdi_ioctl_gbm_get_buff(struct drm_device *dev, void *data, struct drm_file 
 		goto err_event;
 	}
 
-	if (gralloc && gralloc->data_files) {
-		for (i = 0; i < gralloc_buf->numFds; i++) {
+	if (gralloc) {
+		nfd = gralloc_buf->numFds;
+		if (nfd < 0)
+			nfd = 0;
+		else if (nfd > EVDI_MAX_FDS)
+			nfd = EVDI_MAX_FDS;
+
+		for (i = 0; i < nfd; i++) {
 			if (gralloc->data_files[i])
 				fd_install(stack_buf.installed_fds[i], gralloc->data_files[i]);
 		}
@@ -621,22 +698,122 @@ int evdi_ioctl_gbm_get_buff(struct drm_device *dev, void *data, struct drm_file 
 
 	ret = 0;
 err_event:
-	if (gralloc && gralloc->data_files) {
+	if (gralloc) {
+		nfd = gralloc->numFds;
+
+		if (nfd < 0)
+			nfd = 0;
+		else if (nfd > EVDI_MAX_FDS)
+			nfd = EVDI_MAX_FDS;
+
 		if (ret) {
-			for (i = 0; i < gralloc->numFds; i++) {
+			for (i = 0; i < nfd; i++) {
 				if (gralloc->data_files[i]) {
 					fput(gralloc->data_files[i]);
 					gralloc->data_files[i] = NULL;
 				}
 			}
 		} else {
-			for (i = 0; i < gralloc->numFds; i++) {
+			for (i = 0; i < nfd; i++) {
 				gralloc->data_files[i] = NULL;
 			}
 		}
 	}
 	evdi_inflight_req_put(req);
 	return ret;
+}
+
+static inline void evdi_file_track_buffer(struct drm_file *file, int id)
+{
+	struct evdi_file_priv *priv;
+	int ret = 0;
+
+	if (unlikely(!file || id <= 0))
+		return;
+
+	priv = file->driver_priv;
+	if (unlikely(!priv))
+		return;
+
+	mutex_lock(&priv->lock);
+
+#ifdef EVDI_HAVE_XARRAY
+#ifdef EVDI_HAVE_XA_ALLOC_CYCLIC
+	{
+		void *entry;
+		u32 handle = 0;
+
+		entry = xa_load(&priv->bufid_to_handle, id);
+		if (entry)
+			goto out_unlock;
+
+		ret = xa_alloc_cyclic(&priv->handle_to_bufid, &handle,
+				      xa_mk_value((unsigned long)id),
+				      XA_LIMIT(1, INT_MAX),
+				      &priv->next_handle, GFP_KERNEL);
+		if (ret)
+			goto out_unlock;
+
+		ret = xa_err(xa_store(&priv->bufid_to_handle, id,
+				      xa_mk_value((unsigned long)handle),
+				      GFP_KERNEL));
+		if (ret) {
+			xa_erase(&priv->handle_to_bufid, (unsigned long)handle);
+			goto out_unlock;
+		}
+	}
+#else
+	ret = xa_err(xa_store(&priv->buffers, id, xa_mk_value(1), GFP_KERNEL));
+#endif
+#else
+	ret = idr_alloc(&priv->buffers, (void *)1, id, id + 1, GFP_KERNEL);
+	if (ret == id)
+		ret = 0;
+#endif
+
+out_unlock:
+	mutex_unlock(&priv->lock);
+
+	if (unlikely(ret))
+		evdi_warn("Failed to track buffer %d (%d)", id, ret);
+}
+
+static inline void evdi_file_untrack_buffer(struct drm_file *file, int id)
+{
+	struct evdi_file_priv *priv;
+
+	if (unlikely(!file || id <= 0))
+		return;
+
+	priv = file->driver_priv;
+	if (unlikely(!priv))
+		return;
+
+	mutex_lock(&priv->lock);
+
+#ifdef EVDI_HAVE_XARRAY
+#ifdef EVDI_HAVE_XA_ALLOC_CYCLIC
+	{
+		void *entry;
+		u32 handle;
+
+		entry = xa_load(&priv->bufid_to_handle, id);
+		if (!entry)
+			goto out_unlock;
+
+		handle = (u32)xa_to_value(entry);
+		xa_erase(&priv->bufid_to_handle, id);
+		xa_erase(&priv->handle_to_bufid, (unsigned long)handle);
+	}
+#else
+	xa_erase(&priv->buffers, id);
+#endif
+#else
+	idr_remove(&priv->buffers, id);
+#endif
+
+out_unlock:
+	mutex_unlock(&priv->lock);
 }
 
 int evdi_ioctl_gbm_create_buff(struct drm_device *dev, void *data, struct drm_file *file)
@@ -653,10 +830,10 @@ int evdi_ioctl_gbm_create_buff(struct drm_device *dev, void *data, struct drm_fi
 
 	u_id = cmd->id;
 	u_stride = cmd->stride;
-	if (u_id && !access_ok(u_id, sizeof(*u_id)))
+	if (u_id && !evdi_access_ok_write(u_id, sizeof(*u_id)))
 		return -EFAULT;
 
-	if (u_stride && !access_ok(u_stride, sizeof(*u_stride)))
+	if (u_stride && !evdi_access_ok_write(u_stride, sizeof(*u_stride)))
 		return -EFAULT;
 
 	req = evdi_inflight_alloc(evdi, file, create_buf, &poll_id);
@@ -696,6 +873,9 @@ int evdi_ioctl_gbm_create_buff(struct drm_device *dev, void *data, struct drm_fi
 			return -EFAULT;
 		}
 	}
+
+	evdi_file_track_buffer(file, req->reply.create.id);
+
 	if (u_stride) {
 		if (evdi_copy_to_user_allow_partial(u_stride, &req->reply.create.stride, sizeof(*u_stride))) {
 			evdi_inflight_req_put(req);
@@ -732,59 +912,49 @@ int evdi_ioctl_get_buff_callback(struct drm_device *dev, void *data, struct drm_
 	nfd = cb->numFds;
 	nint = cb->numInts;
 
-	{
-		size_t ints_bytes = nint > 0 ? sizeof(int) * nint : 0;
-		size_t files_bytes = nfd > 0 ? sizeof(struct file *) * nfd : 0;
-		size_t total = sizeof(*gralloc) + ints_bytes + files_bytes;
-		void *blk = kvzalloc(total, GFP_KERNEL);
-		char *p;
+	gralloc = mempool_alloc(global_event_pool.gralloc_data_pool, GFP_KERNEL);
+	if (!gralloc)
+		goto out_complete;
 
-		if (!blk)
+	memset(gralloc, 0, sizeof(*gralloc));
+
+	gralloc->version = cb->version;
+	gralloc->numFds = 0;
+	gralloc->numInts = 0;
+
+	if (nint) {
+		if (evdi_copy_from_user_allow_partial(gralloc->data_ints,
+						      cb->data_ints,
+						      sizeof(int) * nint)) {
+			mempool_free(gralloc, global_event_pool.gralloc_data_pool);
 			goto out_complete;
-
-		gralloc = (struct evdi_gralloc_data *)blk;
-		p = (char *)(gralloc + 1);
-		gralloc->data_ints = nint ? (int *)p : NULL;
-		p += ints_bytes;
-		gralloc->data_files = nfd ? (struct file **)p : NULL;
-		atomic_set(&gralloc->is_kvblock, 1);
-		gralloc->version = cb->version;
-		gralloc->numFds = 0;
-		gralloc->numInts = 0;
-
-		if (nint) {
-			if (evdi_copy_from_user_allow_partial(gralloc->data_ints,
-							      cb->data_ints,
-							      sizeof(int) * nint)) {
-				kvfree(blk);
-				goto out_complete;
-			}
-			gralloc->numInts = nint;
 		}
-
-		if (nfd) {
-			if (evdi_copy_from_user_allow_partial(fds_local, cb->fd_ints,
-							      sizeof(int) * nfd)) {
-				kvfree(blk);
-				goto out_complete;
-			}
-			for (i = 0; i < nfd; i++) {
-				gralloc->data_files[i] = fget(fds_local[i]);
-				if (!gralloc->data_files[i]) {
-					for (j = 0; j < i; j++) {
-						if (gralloc->data_files[j]) {
-							fput(gralloc->data_files[j]);
-							gralloc->data_files[j] = NULL;
-						}
-					}
-					kvfree(blk);
-					goto out_complete;
-				}
-			}
-			gralloc->numFds = nfd;
-		}
-		req->reply.get_buf.gralloc_buf.gralloc = gralloc;
+		gralloc->numInts = nint;
 	}
+
+	if (nfd) {
+		if (evdi_copy_from_user_allow_partial(fds_local, cb->fd_ints,
+						      sizeof(int) * nfd)) {
+			mempool_free(gralloc, global_event_pool.gralloc_data_pool);
+			goto out_complete;
+		}
+		for (i = 0; i < nfd; i++) {
+			gralloc->data_files[i] = fget(fds_local[i]);
+			if (!gralloc->data_files[i]) {
+				for (j = 0; j < i; j++) {
+					if (gralloc->data_files[j]) {
+						fput(gralloc->data_files[j]);
+						gralloc->data_files[j] = NULL;
+					}
+				}
+				mempool_free(gralloc, global_event_pool.gralloc_data_pool);
+				goto out_complete;
+			}
+		}
+		gralloc->numFds = nfd;
+	}
+
+	req->reply.get_buf.gralloc_buf.gralloc = gralloc;
 
 out_complete:
 	complete_all(&req->done);
@@ -792,7 +962,7 @@ out_complete:
 	goto out_wake;
 
 out_wake:
-	wake_up_interruptible(&evdi->events.wait_queue);
+	evdi_wakeup_pollers(evdi);
 	return 0;
 }
 
@@ -801,21 +971,8 @@ int evdi_ioctl_destroy_buff_callback(struct drm_device *dev, void *data, struct 
 	struct evdi_device *evdi = dev->dev_private;
 
 	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[4]);
-	EVDI_PERF_INC64(&evdi_perf.callback_completions);
 
-	wake_up_interruptible(&evdi->events.wait_queue);
-
-	return 0;
-}
-
-int evdi_ioctl_swap_callback(struct drm_device *dev, void *data, struct drm_file *file)
-{
-	struct evdi_device *evdi = dev->dev_private;
-
-	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[5]);
-	EVDI_PERF_INC64(&evdi_perf.callback_completions);
-
-	wake_up_interruptible(&evdi->events.wait_queue);
+	evdi_wakeup_pollers(evdi);
 
 	return 0;
 }
@@ -853,6 +1010,9 @@ int evdi_ioctl_gbm_del_buff(struct drm_device *dev, void *data, struct drm_file 
 	long ret;
 
 	ret = evdi_queue_destroy_event(evdi, cmd->id, file);
+	if (!ret)
+		evdi_file_untrack_buffer(file, cmd->id);
+
 	return ret;
 }
 
@@ -860,38 +1020,13 @@ static int evdi_queue_int_event(struct evdi_device *evdi,
 	enum poll_event_type type, int v, struct drm_file *owner)
 {
 	struct evdi_event *event;
-	void *data = NULL;
-	bool small = false;
-
-	data = evdi_small_payload_alloc(GFP_ATOMIC);
-	if (data) {
-		small = true;
-	} else {
-		data = kmalloc(sizeof(int), GFP_ATOMIC);
-		if (!data)
-			return -ENOMEM;
-	}
-
-	memcpy(data, &v, sizeof(int));
 
 	event = evdi_event_alloc(evdi, type,
-				 atomic_inc_return(&evdi->events.next_poll_id),
-				 data, sizeof(int), false, owner);
+		atomic_inc_return(&evdi->events.next_poll_id),
+		(void *)&v, sizeof(int), owner);
 
-	if (!event) {
-		if (small)
-			evdi_small_payload_free(data);
-		else
-			kfree(data);
-
+	if (!event)
 		return -ENOMEM;
-	}
-	if (small)
-		EVDI_PERF_INC64(&evdi_perf.event_payload_small_allocs);
-	else
-		EVDI_PERF_INC64(&evdi_perf.event_payload_heap_allocs);
-
-	event->payload_type = small ? 1 : 2;
 
 	evdi_event_queue(evdi, event);
 	return 0;
@@ -900,19 +1035,47 @@ static int evdi_queue_int_event(struct evdi_device *evdi,
 int evdi_queue_swap_event(struct evdi_device *evdi,
 	int id, int display_id, struct drm_file *owner)
 {
-	struct evdi_event *event;
-	struct evdi_swap data = {
-		.id		= id,
-		.display_id	= display_id,
-	};
+	struct drm_file *client;
+	struct evdi_swap_mailbox *mb;
+	u64 payload;
+	int poll_id;
 
-	event = evdi_event_alloc(evdi, swap_to,
-				 atomic_inc_return(&evdi->events.next_poll_id),
-				 &data, sizeof(data), true, owner);
-	if (!event)
-		return -ENOMEM;
+	if (unlikely(!evdi))
+		return -EINVAL;
 
-	evdi_event_queue(evdi, event);
+	if (unlikely(display_id < 0 || display_id >= LINDROID_MAX_CONNECTORS))
+		return -EINVAL;
+
+	if (unlikely(atomic_read(&evdi->events.stopping)))
+		return -ENODEV;
+
+	client = READ_ONCE(evdi->drm_client);
+
+	if (client)
+		owner = client;
+
+	if (unlikely(!owner))
+		return -ENODEV;
+
+	mb = &evdi->swap_mailbox[display_id];
+	payload = evdi_swap_pack(id, display_id);
+
+	poll_id = atomic_inc_return(&evdi->events.next_poll_id);
+
+	atomic64_inc(&mb->seq); // odd
+	WRITE_ONCE(mb->owner, owner);
+	atomic_set(&mb->poll_id, poll_id);
+	atomic64_set(&mb->payload, payload);
+	evdi_smp_wmb();
+	atomic64_inc(&mb->seq); // even
+
+	EVDI_PERF_INC64(&evdi_perf.swap_updates);
+
+	// Swap events do not use the standard event queue! Do not use evdi_wakeup_pollers
+	// here or set wake pending!
+	evdi_smp_wmb();
+	wake_up_interruptible(&evdi->events.wait_queue);
+
 	return 0;
 }
 
@@ -937,4 +1100,33 @@ int evdi_queue_create_event(struct evdi_device *evdi,
 {
 	int poll_id = atomic_inc_return(&evdi->events.next_poll_id);
 	return evdi_queue_create_event_with_id(evdi, params, owner, poll_id);
+}
+
+int evdi_ioctl_vsync(struct drm_device *dev,
+                     void *data,
+                     struct drm_file *file)
+{
+	struct evdi_device *evdi = dev->dev_private;
+	struct drm_evdi_vsync *vs = data;
+	struct drm_crtc *crtc;
+	int slot;
+
+	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[2]);
+
+	if (unlikely(atomic_read(&evdi->events.stopping)))
+		return -ENODEV;
+
+	slot = vs->display_id;
+
+	if (slot < 0 || slot >= LINDROID_MAX_CONNECTORS)
+		return -EINVAL;
+
+	crtc = &evdi->pipe[slot].crtc;
+
+	if (drm_crtc_vblank_get(crtc) == 0) {
+		drm_crtc_handle_vblank(crtc);
+		drm_crtc_vblank_put(crtc);
+	}
+
+	return 0;
 }

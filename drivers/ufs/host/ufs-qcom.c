@@ -3102,9 +3102,12 @@ int ufs_ioctl_monitor(struct scsi_device *dev, void __user *buf_user)
 	scmd = blk_mq_rq_to_pdu(req);
 
 	cmdlen = COMMAND_SIZE(opcode);
-	if (((VENDOR_SPECIFIC_CDB == opcode) && (0 == strncmp(dev->vendor, "SAMSUNG ", 8)))
-		|| (0 == strncmp(dev->vendor, "SKhynix ", 8)))
+  	if (((VENDOR_SPECIFIC_CDB == opcode) && (0 == strncmp(dev->vendor, "SAMSUNG ", 8)))
+  	         || ((READ_BUFFER == opcode) && (0 == strncmp(dev->vendor, "XBSTOR ", 7)))
+  	         || ((READ_BUFFER == opcode) && (0 == strncmp(dev->vendor, "YMTC ", 5)) && (strnstr(dev->model, "B4TF", 15)))
+  	         || (0 == strncmp(dev->vendor, "SKhynix ", 8))) {
 		cmdlen = 16;
+        }
 
 	/*
 	 * get command and data to send to device, if any

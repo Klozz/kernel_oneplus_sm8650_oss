@@ -12,6 +12,7 @@
 #include "evdi_drv.h"
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/wait.h>
 
 extern int evdi_event_system_init(void);
 extern void evdi_event_system_cleanup(void);
@@ -53,12 +54,12 @@ static const struct drm_ioctl_desc evdi_ioctls[] = {
 			 EVDI_IOCTL_FLAGS),
 	DRM_IOCTL_DEF_DRV(EVDI_DESTROY_BUFF_CALLBACK, evdi_ioctl_destroy_buff_callback,
 			 EVDI_IOCTL_FLAGS),
-	DRM_IOCTL_DEF_DRV(EVDI_SWAP_CALLBACK, evdi_ioctl_swap_callback,
-			 EVDI_IOCTL_FLAGS),
 	DRM_IOCTL_DEF_DRV(EVDI_GBM_CREATE_BUFF_CALLBACK, evdi_ioctl_create_buff_callback,
 			 EVDI_IOCTL_FLAGS),
 	DRM_IOCTL_DEF_DRV(EVDI_GBM_DEL_BUFF, evdi_ioctl_gbm_del_buff,
 			 EVDI_IOCTL_FLAGS),
+	DRM_IOCTL_DEF_DRV(EVDI_VSYNC, evdi_ioctl_vsync,
+			DRM_RENDER_ALLOW),
 };
 
 static struct drm_driver evdi_driver = {
@@ -73,9 +74,11 @@ static struct drm_driver evdi_driver = {
 #if KERNEL_VERSION(5, 9, 0) <= LINUX_VERSION_CODE
 	.gem_create_object = NULL,
 #endif
-	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
-	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
-	.gem_prime_import_sg_table = evdi_prime_import_sg_table,
+	.gem_prime_import = evdi_gem_prime_import,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	.prime_handle_to_fd = evdi_prime_handle_to_fd,
+	.prime_fd_to_handle = evdi_prime_fd_to_handle,
+#endif
 
 	.open = evdi_driver_open,
 	.postclose = evdi_driver_postclose,
@@ -105,12 +108,34 @@ static struct drm_driver evdi_driver = {
 
 static int evdi_driver_open(struct drm_device *dev, struct drm_file *file)
 {
+	struct evdi_file_priv *priv;
+
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	mutex_init(&priv->lock);
+#ifdef EVDI_HAVE_XARRAY
+#ifdef EVDI_HAVE_XA_ALLOC_CYCLIC
+	xa_init_flags(&priv->bufid_to_handle, XA_FLAGS_ALLOC);
+	xa_init_flags(&priv->handle_to_bufid, XA_FLAGS_ALLOC);
+	priv->next_handle = 1;
+#else
+	xa_init(&priv->buffers);
+#endif
+#else
+	idr_init(&priv->buffers);
+#endif
+	priv->swap_rr = 0;
+	file->driver_priv = priv;
+
 	return 0;
 }
 
 static void evdi_driver_postclose(struct drm_device *dev, struct drm_file *file)
 {
 	struct evdi_device *evdi = dev->dev_private;
+	struct evdi_file_priv *priv = file->driver_priv;
 
 	if (unlikely(!evdi))
 		return;
@@ -124,6 +149,24 @@ static void evdi_driver_postclose(struct drm_device *dev, struct drm_file *file)
 	evdi_smp_mb();
 
 	evdi_event_cleanup_file(evdi, file);
+
+	if (priv) {
+		mutex_lock(&priv->lock);
+#ifdef EVDI_HAVE_XARRAY
+#ifdef EVDI_HAVE_XA_ALLOC_CYCLIC
+		xa_destroy(&priv->handle_to_bufid);
+		xa_destroy(&priv->bufid_to_handle);
+#else
+		xa_destroy(&priv->buffers);
+#endif
+#else
+		idr_destroy(&priv->buffers);
+#endif
+		mutex_unlock(&priv->lock);
+
+		kfree(priv);
+		file->driver_priv = NULL;
+	}
 
 	evdi_debug("Device %d closed by process %d", evdi->dev_index, current->pid);
 }
@@ -144,7 +187,7 @@ int evdi_device_init(struct evdi_device *evdi, struct platform_device *pdev)
 	evdi->drm_client = NULL;
 
 	mutex_init(&evdi->config_mutex);
-	
+
 #ifdef EVDI_HAVE_XARRAY
 	xa_init_flags(&evdi->file_xa, XA_FLAGS_ALLOC);
 	xa_init_flags(&evdi->inflight_xa, XA_FLAGS_ALLOC);
@@ -270,13 +313,11 @@ static int evdi_platform_probe(struct platform_device *pdev)
 		goto err_modeset;
 	}
 
-#if EVDI_HAVE_ATOMIC_HELPERS
-	drm_mode_config_reset(ddev);
-#endif
-
+#if !EVDI_HAVE_ATOMIC_HELPERS
 	ret = drm_vblank_init(ddev, LINDROID_MAX_CONNECTORS);
 	if (ret)
 		evdi_warn("vblank init failed: %d", ret);
+#endif
 
 	drm_kms_helper_poll_init(ddev);
 
