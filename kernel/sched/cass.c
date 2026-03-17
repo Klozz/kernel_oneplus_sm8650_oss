@@ -93,7 +93,7 @@ static __always_inline
 void cass_compute_eevdf_lag(struct cass_cpu_cand *c, u64 se_vruntime)
 {
 	struct cfs_rq *cfs_rq = &cpu_rq(c->cpu)->cfs;
-	c->eevdf_lag = READ_ONCE(cfs_rq->avg_vruntime) - (s64)se_vruntime;
+	c->eevdf_lag = READ_ONCE(cfs_rq->zero_vruntime) - (s64)se_vruntime;
 }
 
 /*
@@ -299,7 +299,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	eevdf_lag_margin = SCHED_CAPACITY_SCALE / 16;
 	if (!rt && !sync && !uc_min && p_util < (SCHED_CAPACITY_SCALE / 8)) {
 		cfs_rq = &cpu_rq(this_cpu)->cfs;
-		s64 this_lag = READ_ONCE(cfs_rq->avg_vruntime) - (s64)p_vruntime;
+		s64 this_lag = READ_ONCE(cfs_rq->zero_vruntime) - (s64)p_vruntime;
 
 		if (this_lag < 0) {
 			eevdf_lag_margin = SCHED_CAPACITY_SCALE / 8;
@@ -355,7 +355,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * only running task.
 		 */
 		if ((sync && cpu == this_cpu && rq->nr_running == 1) ||
-		    available_idle_cpu(cpu) || sched_idle_cpu(cpu)) {
+		    choose_idle_cpu(cpu, p)) {
 			/*
 			 * A non-idle candidate may be better for energy
 			 * efficiency when @p is uclamp boosted above @curr's
