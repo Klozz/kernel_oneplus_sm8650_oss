@@ -68,6 +68,9 @@ static struct drm_driver evdi_driver = {
 #if EVDI_HAVE_ATOMIC_HELPERS
 			  DRIVER_ATOMIC |
 #endif
+#ifdef DRIVER_PRIME
+			  DRIVER_PRIME |
+#endif
 			  DRIVER_GEM,
 
 	.dumb_create = evdi_dumb_create,
@@ -75,10 +78,8 @@ static struct drm_driver evdi_driver = {
 	.gem_create_object = NULL,
 #endif
 	.gem_prime_import = evdi_gem_prime_import,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 	.prime_handle_to_fd = evdi_prime_handle_to_fd,
 	.prime_fd_to_handle = evdi_prime_fd_to_handle,
-#endif
 
 	.open = evdi_driver_open,
 	.postclose = evdi_driver_postclose,
@@ -96,14 +97,6 @@ static struct drm_driver evdi_driver = {
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
-#ifdef DRIVER_PRIME
-	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME
-#else
-	.driver_features = DRIVER_MODESET | DRIVER_GEM
-#endif
-#if EVDI_HAVE_ATOMIC_HELPERS
-		| DRIVER_ATOMIC
-#endif
 };
 
 static int evdi_driver_open(struct drm_device *dev, struct drm_file *file)
@@ -127,6 +120,7 @@ static int evdi_driver_open(struct drm_device *dev, struct drm_file *file)
 	idr_init(&priv->buffers);
 #endif
 	priv->swap_rr = 0;
+	priv->pending_swaps = 0;
 	file->driver_priv = priv;
 
 	return 0;
@@ -162,6 +156,9 @@ static void evdi_driver_postclose(struct drm_device *dev, struct drm_file *file)
 #else
 		idr_destroy(&priv->buffers);
 #endif
+		WRITE_ONCE(priv->pending_swaps, 0);
+		memset(priv->last_swap_seq, 0, sizeof(priv->last_swap_seq));
+		priv->swap_rr = 0;
 		mutex_unlock(&priv->lock);
 
 		kfree(priv);
@@ -397,17 +394,35 @@ static int __init evdi_init(void)
 		return ret;
 	}
 
+	ret = evdi_fb_cache_init();
+	if (ret) {
+		evdi_err("Failed to initialize framebuffer cache: %d", ret);
+		evdi_event_system_cleanup();
+		return ret;
+	}
+
+	ret = evdi_gem_cache_init();
+	if (ret) {
+		evdi_err("Failed to initialize GEM cache: %d", ret);
+		evdi_event_system_cleanup();
+		return ret;
+	}
+
 	ret = platform_driver_register(&evdi_platform_driver);
 	if (ret) {
 		evdi_err("Failed to register platform driver: %d", ret);
+		evdi_fb_cache_cleanup();
+		evdi_gem_cache_cleanup();
 		evdi_event_system_cleanup();
-	return ret;
+		return ret;
 	}
 
 	ret = evdi_sysfs_init();
 	if (ret) {
 		evdi_err("Failed to initialize sysfs: %d", ret);
 		platform_driver_unregister(&evdi_platform_driver);
+		evdi_fb_cache_cleanup();
+		evdi_gem_cache_cleanup();
 		evdi_event_system_cleanup();
 		return ret;
 	}
@@ -423,6 +438,10 @@ static void __exit evdi_exit(void)
 	evdi_sysfs_cleanup();
 
 	platform_driver_unregister(&evdi_platform_driver);
+
+	evdi_fb_cache_cleanup();
+
+	evdi_gem_cache_cleanup();
 
 	evdi_event_system_cleanup();
 

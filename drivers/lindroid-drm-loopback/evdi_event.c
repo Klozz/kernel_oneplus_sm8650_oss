@@ -25,33 +25,6 @@ struct evdi_perf_counters evdi_perf;
 
 static DEFINE_PER_CPU(int, evdi_inflight_last_slot);
 
-static __always_inline bool evdi_swap_pending_for_file(struct evdi_device *evdi,
-						       struct drm_file *file)
-{
-	struct evdi_file_priv *priv;
-	u64 seq;
-	int i;
-
-	if (unlikely(!evdi || !file))
-		return false;
-
-	priv = file->driver_priv;
-	if (unlikely(!priv))
-		return false;
-
-	for (i = 0; i < LINDROID_MAX_CONNECTORS; i++) {
-		if (READ_ONCE(evdi->swap_mailbox[i].owner) != file)
-			continue;
-		seq = (u64)atomic64_read(&evdi->swap_mailbox[i].seq);
-		if (seq & 1)
-			continue;
-		if (seq != priv->last_swap_seq[i])
-			return true;
-	}
-
-	return false;
-}
-
 static void *evdi_inflight_req_pool_alloc(gfp_t gfp_mask, void *pool_data)
 {
 	return kvzalloc(sizeof(struct evdi_inflight_req), gfp_mask);
@@ -98,18 +71,36 @@ int evdi_event_system_init(void)
 	char name[32];
 	int i;
 
+#if EVDI_HAVE_KMEM_USERCOPY
+	global_event_pool.cache = kmem_cache_create_usercopy("evdi_events",
+						   sizeof(struct evdi_event),
+						   0, SLAB_HWCACHE_ALIGN,
+						   offsetof(struct evdi_event, payload),
+						   sizeof(((struct evdi_event *)0)->payload),
+						   NULL);
+#else
 	global_event_pool.cache = kmem_cache_create("evdi_events",
 						   sizeof(struct evdi_event),
 						   0, SLAB_HWCACHE_ALIGN,
 						   NULL);
+#endif
 	if (!global_event_pool.cache)
 		return -ENOMEM;
 
 	for (i = 0; i < EVDI_EVENT_TYPE_MAX; i++) {
 		snprintf(name, sizeof(name), "evdi_events_%d", i);
 		global_event_pool.type_cache[i] =
+#if EVDI_HAVE_KMEM_USERCOPY
+			kmem_cache_create_usercopy(name,
+						   sizeof(struct evdi_event),
+						   0, SLAB_HWCACHE_ALIGN,
+						   offsetof(struct evdi_event, payload),
+						   sizeof(((struct evdi_event *)0)->payload),
+						   NULL);
+#else
 			kmem_cache_create(name, sizeof(struct evdi_event),
 					  0, SLAB_HWCACHE_ALIGN, NULL);
+#endif
 		if (!global_event_pool.type_cache[i]) {
 			evdi_event_destroy_caches();
 			return -ENOMEM;
@@ -199,6 +190,7 @@ int evdi_event_init(struct evdi_device *evdi)
 	evdi->events.head = NULL;
 	evdi->events.tail = NULL;
 	atomic_set(&evdi->events.queue_size, 0);
+	atomic_set(&evdi->events.mailbox_wake_pending, 0);
 	atomic_set(&evdi->events.next_poll_id, 1);
 	atomic_set(&evdi->events.stopping, 0);
 
@@ -223,6 +215,8 @@ int evdi_event_init(struct evdi_device *evdi)
 
 void evdi_swap_mailbox_invalidate_display(struct evdi_device *evdi, int display_id)
 {
+	struct drm_file *old_owner;
+	struct evdi_file_priv *priv;
 	struct evdi_swap_mailbox *mb;
 
 	if (!evdi)
@@ -232,6 +226,8 @@ void evdi_swap_mailbox_invalidate_display(struct evdi_device *evdi, int display_
 
 	mb = &evdi->swap_mailbox[display_id];
 
+	old_owner = READ_ONCE(mb->owner);
+
 	/* Mark as unstable, clear owner/payload, then mark stable again */
 	atomic64_inc(&mb->seq);
 	WRITE_ONCE(mb->owner, NULL);
@@ -239,6 +235,10 @@ void evdi_swap_mailbox_invalidate_display(struct evdi_device *evdi, int display_
 	atomic64_set(&mb->payload, 0);
 	evdi_smp_wmb();
 	atomic64_inc(&mb->seq);
+
+	priv = old_owner ? old_owner->driver_priv : NULL;
+	if (priv)
+		clear_bit(display_id, &priv->pending_swaps);
 }
 
 void evdi_event_cleanup(struct evdi_device *evdi)
@@ -270,6 +270,7 @@ void evdi_event_cleanup(struct evdi_device *evdi)
 	WRITE_ONCE(evdi->events.head, NULL);
 	WRITE_ONCE(evdi->events.tail, NULL);
 	atomic_set(&evdi->events.queue_size, 0);
+	atomic_set(&evdi->events.mailbox_wake_pending, 0);
 	atomic_set(&evdi->events.wake_pending, 0);
 	spin_unlock(&evdi->events.lock);
 
@@ -390,6 +391,19 @@ static void evdi_inflight_req_release(struct kref *kref)
 	}
 }
 
+static __always_inline void evdi_inflight_req_reinit_fast(struct evdi_inflight_req *req,
+							  int slot)
+{
+	memset(&req->reply, 0, sizeof(req->reply));
+	req->type = 0;
+	req->owner = NULL;
+	kref_init(&req->refcount);
+	init_completion(&req->done);
+	atomic_set(&req->from_percpu, 1);
+	atomic_set(&req->freed, 0);
+	req->percpu_slot = slot;
+}
+
 struct evdi_inflight_req *evdi_inflight_req_alloc(struct evdi_device *evdi)
 {
 	struct evdi_inflight_req *req = NULL;
@@ -423,16 +437,16 @@ struct evdi_inflight_req *evdi_inflight_req_alloc(struct evdi_device *evdi)
 			return NULL;
 	}
 
+	if (likely(from_percpu)) {
+		evdi_inflight_req_reinit_fast(req, sel_slot);
+		return req;
+	}
+
 	memset(req, 0, sizeof(*req));
 	kref_init(&req->refcount);
 	init_completion(&req->done);
-	if (from_percpu) {
-		atomic_set(&req->from_percpu, 1);
-		req->percpu_slot = sel_slot;
-	} else {
-		atomic_set(&req->from_percpu, 0);
-		req->percpu_slot = -1;
-	}
+	atomic_set(&req->from_percpu, 0);
+	req->percpu_slot = -1;
 	atomic_set(&req->freed, 0);
 
 	return req;
@@ -458,13 +472,6 @@ void evdi_event_free_immediate(struct evdi_event *event)
 	}
 }
 
-void evdi_event_free_rcu(struct rcu_head *head)
-{
-	struct evdi_event *event = container_of(head, struct evdi_event, rcu);
-
-	evdi_event_free_immediate(event);
-}
-
 void evdi_event_free(struct evdi_event *event)
 {
 	if (!event)
@@ -473,7 +480,7 @@ void evdi_event_free(struct evdi_event *event)
 	if (atomic_xchg(&event->freed, 1))
 		return;
 
-	call_rcu(&event->rcu, evdi_event_free_rcu);
+	evdi_event_free_immediate(event);
 }
 
 static inline bool evdi_event_queue_lockfree(struct evdi_device *evdi, struct evdi_event *event)
@@ -548,39 +555,67 @@ static inline struct evdi_event *evdi_event_pop_head_locked(struct evdi_device *
 	return e;
 }
 
-static inline void evdi_event_drain_lockfree(struct evdi_device *evdi)
+static inline void evdi_event_append_list_locked(struct evdi_device *evdi,
+						 struct evdi_event *first,
+						 struct evdi_event *last)
 {
-	struct llist_node *lst, *node;
-	struct evdi_event *first = NULL, *last = NULL;
-
-	lst = llist_del_all(&evdi->events.lockfree_head);
-	if (!lst)
-		return;
-
-	lst = llist_reverse_order(lst);
-	for (node = lst; node; node = node->next) {
-		struct evdi_event *e = llist_entry(node, struct evdi_event, llist);
-		e->next = NULL;
-		if (!first)
-			first = e;
-		else
-			last->next = e;
-
-		last = e;
-	}
-
 	if (!first)
 		return;
 
-	spin_lock(&evdi->events.lock);
-	if (!evdi->events.head) {
+	if (!READ_ONCE(evdi->events.head)) {
 		WRITE_ONCE(evdi->events.head, first);
 		WRITE_ONCE(evdi->events.tail, last);
 	} else {
 		WRITE_ONCE(evdi->events.tail->next, first);
 		WRITE_ONCE(evdi->events.tail, last);
 	}
-	spin_unlock(&evdi->events.lock);
+}
+
+static inline struct evdi_event *evdi_event_take_from_lockfree(struct evdi_device *evdi)
+{
+	struct llist_node *lst, *node;
+	struct evdi_event *e;
+	struct evdi_event *event = NULL;
+	struct evdi_event *first = NULL, *last = NULL;
+
+	lst = llist_del_all(&evdi->events.lockfree_head);
+	if (!lst)
+		return NULL;
+
+	// Single event fast path
+	if (unlikely(!lst->next)) {
+		e = llist_entry(lst, struct evdi_event, llist);
+		e->next = NULL;
+		return e;
+	}
+
+	lst = llist_reverse_order(lst);
+	for (node = lst; node; node = node->next) {
+		struct evdi_event *e = llist_entry(node, struct evdi_event, llist);
+		e->next = NULL;
+		if (!event) {
+			event = e;
+			continue;
+		}
+
+		if (!first) {
+			first = e;
+			last = e;
+		} else {
+			last->next = e;
+			last = e;
+		}
+	}
+
+	if (!event)
+		return NULL;
+
+	if (first) {
+		spin_lock(&evdi->events.lock);
+		evdi_event_append_list_locked(evdi, first, last);
+		spin_unlock(&evdi->events.lock);
+	}
+	return event;
 }
 
 struct evdi_event *evdi_event_dequeue(struct evdi_device *evdi)
@@ -608,7 +643,9 @@ struct evdi_event *evdi_event_dequeue(struct evdi_device *evdi)
 			goto found_one;
 	}
 
-	evdi_event_drain_lockfree(evdi);
+	event = evdi_event_take_from_lockfree(evdi);
+	if (event)
+		goto found_one;
 	spin_lock(&evdi->events.lock);
 	event = evdi_event_pop_head_locked(evdi);
 	spin_unlock(&evdi->events.lock);
@@ -633,6 +670,7 @@ void evdi_event_cleanup_file(struct evdi_device *evdi, struct drm_file *file)
 	struct evdi_event *new_head = NULL, *new_tail = NULL;
 	struct evdi_event **restore_events = NULL;
 	struct llist_node *llnode, *next_node = NULL;
+	struct evdi_file_priv *priv;
 	int lf_removed = 0;
 	int sp_removed = 0;
 	int restore_count = 0;
@@ -641,6 +679,13 @@ void evdi_event_cleanup_file(struct evdi_device *evdi, struct drm_file *file)
 
 	if (unlikely(!evdi || !file))
 		return;
+
+	priv = file->driver_priv;
+	if (priv) {
+		WRITE_ONCE(priv->pending_swaps, 0);
+		memset(priv->last_swap_seq, 0, sizeof(priv->last_swap_seq));
+		priv->swap_rr = 0;
+	}
 
 	for (d = 0; d < LINDROID_MAX_CONNECTORS; d++) {
 		if (READ_ONCE(evdi->swap_mailbox[d].owner) != file)
@@ -671,7 +716,7 @@ void evdi_event_cleanup_file(struct evdi_device *evdi, struct drm_file *file)
 		if (event->owner == file) {
 			lf_removed++;
 			atomic_dec(&evdi->events.queue_size);
-			call_rcu(&event->rcu, evdi_event_free_rcu);
+			evdi_event_free(event);
 		} else if (restore_events && restore_count < restore_capacity) {
 			restore_events[restore_count++] = event;
 		}
@@ -692,7 +737,7 @@ void evdi_event_cleanup_file(struct evdi_device *evdi, struct drm_file *file)
 		next = READ_ONCE(event->next);
 		if (event->owner == file) {
 			sp_removed++;
-			call_rcu(&event->rcu, evdi_event_free_rcu);
+			evdi_event_free(event);
 		} else {
 			WRITE_ONCE(event->next, NULL);
 			if (!new_head) {
@@ -725,6 +770,24 @@ void evdi_event_cleanup_file(struct evdi_device *evdi, struct drm_file *file)
 			   lf_removed + sp_removed, lf_removed, sp_removed);
 }
 
+static __always_inline int evdi_event_wait_ready(struct evdi_device *evdi,
+						 struct drm_file *file)
+{
+	if (atomic_read(&evdi->events.queue_size) > 0)
+		return 0;
+
+	if (evdi_swap_file_pending(file))
+		return 0;
+
+	if (atomic_read(&evdi->events.stopping))
+		return -ENODEV;
+
+	if (signal_pending(current))
+		return -ERESTARTSYS;
+
+	return 1;
+}
+
 int evdi_event_wait(struct evdi_device *evdi, struct drm_file *file)
 {
 	DEFINE_WAIT(wait);
@@ -733,36 +796,26 @@ int evdi_event_wait(struct evdi_device *evdi, struct drm_file *file)
 	EVDI_PERF_INC64(&evdi_perf.poll_cycles);
 
 	for (;;) {
+		ret = evdi_event_wait_ready(evdi, file);
+		if (ret != 1)
+			break;
 		prepare_to_wait(&evdi->events.wait_queue, &wait, TASK_INTERRUPTIBLE);
 
-		if (atomic_read_acquire(&evdi->events.wake_pending)) {
+		if (atomic_read_acquire(&evdi->events.wake_pending) ||
+		    atomic_read_acquire(&evdi->events.mailbox_wake_pending)) {
 #ifdef EVDI_HAVE_ATOMIC_CMPXCHG_RELAXED
 			atomic_xchg_relaxed(&evdi->events.wake_pending, 0);
+			atomic_xchg_relaxed(&evdi->events.mailbox_wake_pending, 0);
 #else
 			atomic_set(&evdi->events.wake_pending, 0);
+			atomic_set(&evdi->events.mailbox_wake_pending, 0);
 #endif
 		}
 
 		evdi_smp_mb();
-		if (atomic_read(&evdi->events.queue_size) > 0) {
-			ret = 0;
+		ret = evdi_event_wait_ready(evdi, file);
+		if (ret != 1)
 			break;
-		}
-
-		if (evdi_swap_pending_for_file(evdi, file)) {
-			ret = 0;
-			break;
-		}
-
-		if (atomic_read(&evdi->events.stopping)) {
-			ret = -ENODEV;
-			break;
-		}
-
-		if (signal_pending(current)) {
-			ret = -ERESTARTSYS;
-			break;
-		}
 		schedule();
 	}
 	finish_wait(&evdi->events.wait_queue, &wait);

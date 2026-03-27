@@ -44,6 +44,21 @@ static void evdi_pipe_disable(struct drm_simple_display_pipe *pipe)
 	drm_crtc_vblank_off(&pipe->crtc);
 }
 
+static __always_inline int evdi_pipe_slot(const struct evdi_device *evdi,
+			const struct drm_simple_display_pipe *pipe)
+{
+	ptrdiff_t slot;
+
+	if (unlikely(!evdi || !pipe))
+		return -ENOENT;
+
+	slot = pipe - &evdi->pipe[0];
+	if (unlikely(slot < 0 || slot >= LINDROID_MAX_CONNECTORS))
+		return -ENOENT;
+
+	return (int)slot;
+}
+
 static void evdi_pipe_update(struct drm_simple_display_pipe *pipe,
                              struct drm_plane_state *old_state)
 {
@@ -60,7 +75,7 @@ static void evdi_pipe_update(struct drm_simple_display_pipe *pipe,
 	int bound_display_id;
 	int slot;
 
-	slot = evdi_connector_slot(evdi, pipe->connector);
+	slot = evdi_pipe_slot(evdi, pipe);
 
 	if (unlikely(slot < 0 || slot >= LINDROID_MAX_CONNECTORS))
 		return;
@@ -79,10 +94,8 @@ static void evdi_pipe_update(struct drm_simple_display_pipe *pipe,
 	if (!state || !fb || unlikely(!READ_ONCE(evdi->drm_client)))
 		return;
 
-	mutex_lock(&evdi->config_mutex);
-	connected = evdi->displays[slot].connected;
-	generation = evdi->displays[slot].generation;
-	mutex_unlock(&evdi->config_mutex);
+	connected = READ_ONCE(evdi->displays[slot].connected);
+	generation = READ_ONCE(evdi->displays[slot].generation);
 
 	if (!connected)
 		return;
@@ -146,7 +159,7 @@ int evdi_modeset_init(struct drm_device *dev)
 	int ret = 0;
 	int i;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
 	ret = drm_mode_config_init(dev);
 	if (ret) {
 		evdi_err("Failed to initialize mode config: %d", ret);

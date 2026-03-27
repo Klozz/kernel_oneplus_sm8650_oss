@@ -354,6 +354,40 @@ static void virtinput_remove(struct virtio_device *vdev)
 	kfree(vi);
 }
 
+#ifdef CONFIG_PM_SLEEP
+static int virtinput_freeze(struct virtio_device *vdev)
+{
+	struct virtio_input *vi = vdev->priv;
+	unsigned long flags;
+	void *buf;
+
+	spin_lock_irqsave(&vi->lock, flags);
+	vi->ready = false;
+	spin_unlock_irqrestore(&vi->lock, flags);
+
+	virtio_reset_device(vdev);
+	while ((buf = virtqueue_detach_unused_buf(vi->sts)) != NULL)
+		kfree(buf);
+	vdev->config->del_vqs(vdev);
+	return 0;
+}
+
+static int virtinput_restore(struct virtio_device *vdev)
+{
+	struct virtio_input *vi = vdev->priv;
+	int err;
+
+	err = virtinput_init_vqs(vi);
+	if (err)
+		return err;
+
+	virtio_device_ready(vdev);
+	vi->ready = true;
+	virtinput_fill_evt(vi);
+	return 0;
+}
+#endif
+
 static unsigned int features[] = {
 	/* none */
 };

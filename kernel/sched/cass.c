@@ -24,7 +24,6 @@
  * relative utilization, all CPUs are kept at their lowest P-state necessary to
  * satisfy the overall load at any given moment.
  */
-#include <linux/string.h>
 
 struct cass_cpu_cand {
 	int cpu;
@@ -40,7 +39,6 @@ struct cass_cpu_cand {
 	unsigned long eff_util;
 	unsigned long hard_util;
 	unsigned long util;
-	s64 eevdf_lag;
 };
 
 static __always_inline
@@ -69,9 +67,6 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	if (sync && c->cpu == this_cpu && !rt_task(current))
 		c->util -= min(c->util, task_util(current));
 
-	/* Initialize eevdf lag */
-	c->eevdf_lag = 0;
-
 	/* Get the utilization of everything other than CFS tasks */
 	hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
 	c->hard_util = hard_util;
@@ -88,27 +83,33 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	c->cap_no_therm = c->cap_orig - min(hard_util, c->cap_orig - 1);
 }
 
-/* EEVDF lag approximation for a candidate CPU. */
-static __always_inline
-void cass_compute_eevdf_lag(struct cass_cpu_cand *c, u64 se_vruntime)
-{
-	struct cfs_rq *cfs_rq = &cpu_rq(c->cpu)->cfs;
-	c->eevdf_lag = READ_ONCE(cfs_rq->zero_vruntime) - (s64)se_vruntime;
-}
-
 /*
- * Returns true if @c is a CPU with the maximum possible original capacity and
- * there's only one such CPU in the system (i.e., if @c is the prime CPU).
+ * Returns the CPU id of the single prime CPU, or -1 if there isn't one.
  */
 static __always_inline
-bool cass_prime_cpu(const struct cass_cpu_cand *c)
+int cass_prime_cpu_id(void)
 {
-	/*
-	 * On arm64, the prime CPU is always the last CPU. If it doesn't have
-	 * the same original capacity as the prior CPU, then it is prime.
-	 */
-	return c->cpu == nr_cpu_ids - 1 &&
-	       arch_scale_cpu_capacity(nr_cpu_ids - 2) < SCHED_CAPACITY_SCALE;
+	int prime = -1, prev = -1;
+	int cpu;
+
+	for_each_cpu(cpu, cpu_possible_mask) {
+		prev = prime;
+		prime = cpu;
+	}
+
+	if (prime < 0 || prev < 0)
+		return -1;
+
+	if (arch_scale_cpu_capacity(prev) >= arch_scale_cpu_capacity(prime))
+		return -1;
+
+	return prime;
+}
+
+static __always_inline
+bool cass_prime_cpu(const struct cass_cpu_cand *c, int prime_cpu)
+{
+	return c->cpu == prime_cpu;
 }
 
 /* Returns true if @a is a better CPU than @b */
@@ -116,13 +117,14 @@ static __always_inline
 bool cass_cpu_better(const struct cass_cpu_cand *a,
 		     const struct cass_cpu_cand *b, unsigned long p_util,
 		     unsigned long uc_min, int this_cpu, int prev_cpu, bool sync,
-		     bool rt, bool prefer_idle, bool allow_prime_avoidance, s64 eevdf_lag_margin)
+		     bool rt, bool prefer_idle, bool allow_prime_avoidance,
+		     s64 eevdf_lag_margin, int prime_cpu)
 {
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
 	long res;
-	bool a_prime = cass_prime_cpu(a);
-	bool b_prime = cass_prime_cpu(b);
+	bool a_prime = cass_prime_cpu(a, prime_cpu);
+	bool b_prime = cass_prime_cpu(b, prime_cpu);
 	const struct cass_cpu_cand *non_prime;
 	unsigned long margin, hyst;
 
@@ -263,20 +265,59 @@ bool cass_allow_prime_avoidance(unsigned long p_util, unsigned long uc_min, bool
 	return p_util < (SCHED_CAPACITY_SCALE / 8);
 }
 
+static __always_inline
+bool cass_prev_cpu_fastpath(struct task_struct *p, int prev_cpu, int this_cpu,
+			    unsigned long p_util, unsigned long uc_min,
+			    bool sync, bool rt)
+{
+	struct cass_cpu_cand c = { .cpu = prev_cpu };
+	struct rq *rq;
+	unsigned long therm;
+
+	if (!cpumask_test_cpu(prev_cpu, p->cpus_ptr) || !cpu_active(prev_cpu))
+		return false;
+
+	rq = cpu_rq(prev_cpu);
+
+	if (!((sync && prev_cpu == this_cpu && rq->nr_running == 1) ||
+	      choose_idle_cpu(prev_cpu, p)))
+		return false;
+
+	c.cap_orig = max_t(unsigned long, 1, arch_scale_cpu_capacity(prev_cpu));
+	therm = min(thermal_load_avg(rq), c.cap_orig - 1);
+	c.cap_max = c.cap_orig - therm;
+	c.therm = therm;
+
+	if (c.cap_max < uc_min)
+		return false;
+
+	cass_cpu_util(&c, this_cpu, sync);
+
+	if (prev_cpu != task_cpu(p))
+		c.util += p_util;
+
+	c.eff_util = max(c.util + c.hard_util, uc_min);
+
+	if (!fits_capacity(p_util, c.cap_max))
+		return false;
+
+	return c.eff_util <= c.cap_max;
+}
+
 static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt)
 {
 	/* Initialize @best such that @best always has a valid CPU at the end */
 	struct cass_cpu_cand cands[2], *best = cands;
 	struct cfs_rq *cfs_rq;
+	int p_cpu = task_cpu(p);
 	int this_cpu = raw_smp_processor_id();
 	unsigned long p_util, uc_min, eevdf_lag_margin;
-	bool has_idle = false;
+	bool has_idle = false, best_valid = false;
 	u64 p_vruntime = 0;
 	bool allow_prime_avoidance;
 	bool prefer_idle;
+	int prime_cpu;
 	int cidx = 0, cpu;
-
-	memset(cands, 0, sizeof(cands));
 
 	/*
 	 * Get the utilization and uclamp minimum threshold for this task. Note
@@ -286,12 +327,16 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 	uc_min = uclamp_eff_value(p, UCLAMP_MIN);
 
 	allow_prime_avoidance = cass_allow_prime_avoidance(p_util, uc_min, sync);
+	prime_cpu = cass_prime_cpu_id();
 
 	/*
 	 * Prefer idle CPUs for sync wakes and for "heavy enough" work; otherwise,
 	 * prefer packing onto an already-active CPU.
 	 */
 	prefer_idle = sync || rt || uc_min || p_util >= (SCHED_CAPACITY_SCALE / 8);
+
+	if (cass_prev_cpu_fastpath(p, prev_cpu, this_cpu, p_util, uc_min, sync, rt))
+		return prev_cpu;
 
 	if (!rt)
 		p_vruntime = READ_ONCE(p->se.vruntime);
@@ -338,15 +383,16 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		}
 
 		/* Get the original, maximum _possible_ capacity of this CPU */
-		curr->cap_orig = arch_scale_cpu_capacity(cpu);
+		curr->cap_orig = max_t(unsigned long, 1,
+				       arch_scale_cpu_capacity(cpu));
 
 		/* Get the _current_, throttled maximum capacity of this CPU */
-		therm = thermal_load_avg(rq);
+		therm = min(thermal_load_avg(rq), curr->cap_orig - 1);
 		curr->cap_max = curr->cap_orig - therm;
 		curr->therm = therm;
 
 		/* Prefer the CPU that more closely meets the uclamp minimum */
-		if (curr->cap_max < uc_min && best->cap_max >= uc_min)
+		if (best_valid && curr->cap_max < uc_min && best->cap_max >= uc_min)
 			continue;
 
 		/*
@@ -365,7 +411,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			 */
 			if (!has_idle && prefer_idle &&
 			    uc_min <= arch_scale_min_freq_capacity(cpu) &&
-			    !cass_prime_cpu(curr)) {
+			    !cass_prime_cpu(curr, prime_cpu)) {
 				/* Discard any previous non-idle candidate */
 				best = curr;
 				has_idle = true;
@@ -390,15 +436,12 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		/* Get this CPU's capacity and utilization */
 		cass_cpu_util(curr, this_cpu, sync);
 
-		if (!rt)
-			cass_compute_eevdf_lag(curr, p_vruntime);
-
 		/*
 		 * Add @p's utilization to this CPU if it's not @p's CPU, to
 		 * find what this CPU's relative utilization would look like if
 		 * @p were on it.
 		 */
-		if (cpu != task_cpu(p))
+		if (cpu != p_cpu)
 			curr->util += p_util;
 
 		/*
@@ -435,10 +478,12 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * If @best == @curr then there's no need to compare them, but
 		 * cidx still needs to be changed to the other candidate slot.
 		 */
-		if (best == curr ||
+		if (!best_valid ||
 			cass_cpu_better(curr, best, p_util, uc_min, this_cpu, prev_cpu,
-				    sync, rt, prefer_idle, allow_prime_avoidance, eevdf_lag_margin)) {
+				    sync, rt, prefer_idle, allow_prime_avoidance,
+				    eevdf_lag_margin, prime_cpu)) {
 			best = curr;
+			best_valid = true;
 			cidx ^= 1;
 			/*
 			 * Early-exit when we land on an idle, cache-affined CPU that
@@ -446,7 +491,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			 */
 			if (best->exit_lat &&
 				best->cpu == prev_cpu &&
-				!cass_prime_cpu(best) &&
+				!cass_prime_cpu(best, prime_cpu) &&
 				best->cap_max >= uc_min &&
 				fits_capacity(p_util, best->cap_max) &&
 				best->eff_util <= best->cap_max)
@@ -457,7 +502,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			*/
 			if (!best->exit_lat &&
 				best->cpu == prev_cpu &&
-				!cass_prime_cpu(best) &&
+				!cass_prime_cpu(best, prime_cpu) &&
 				best->cap_max >= uc_min &&
 				fits_capacity(p_util, best->cap_max) &&
 				best->eff_util <= best->cap_max)

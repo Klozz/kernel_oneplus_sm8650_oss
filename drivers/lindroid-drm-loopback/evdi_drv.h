@@ -23,6 +23,7 @@
 #include <linux/fs.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
+#include <linux/bitops.h>
 #include <linux/jiffies.h>
 #include <linux/kref.h>
 #include <linux/spinlock.h>
@@ -40,7 +41,6 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
-#include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 #elif KERNEL_VERSION(4, 11, 0) <= LINUX_VERSION_CODE
 #include <drm/drm_drv.h>
@@ -48,6 +48,10 @@
 #include <drm/drm_gem.h>
 #else
 #include <drm/drmP.h>
+#endif
+
+#if KERNEL_VERSION(5, 1, 0) <= LINUX_VERSION_CODE
+#include <drm/drm_probe_helper.h>
 #endif
 
 #include <drm/drm_crtc.h>
@@ -170,22 +174,21 @@ struct evdi_event_pool {
 struct evdi_event {
 	enum poll_event_type type;
 	int poll_id;
-	struct rcu_head rcu;
-	u8 cache_idx;
-	u8 payload[EVDI_EVENT_PAYLOAD_MAX];
 	u32 payload_size;
+	u8 payload[EVDI_EVENT_PAYLOAD_MAX];
 	struct evdi_event *next;
-	bool from_pool;
-	struct drm_file *owner;
 	struct llist_node llist;
+	struct drm_file *owner;
 	struct evdi_device *evdi;
 	atomic_t freed;
+	u8 cache_idx;
+	bool from_pool;
 };
 
 struct evdi_inflight_req {
 	int type;
-	struct completion done;
 	struct drm_file *owner;
+	struct completion done;
 	struct kref refcount;
 	atomic_t from_percpu;
 	atomic_t freed;
@@ -279,6 +282,7 @@ struct evdi_file_priv {
 #endif
 	u64 last_swap_seq[LINDROID_MAX_CONNECTORS];
 	u8 swap_rr;
+	unsigned long pending_swaps;
 };
 
 struct evdi_device {
@@ -307,6 +311,7 @@ struct evdi_device {
 		struct evdi_event_pool pool;
 		atomic_t wake_pending;
 		atomic_t queue_size;
+		atomic_t mailbox_wake_pending;
 		atomic_t next_poll_id;
 		atomic_t stopping;
 		atomic64_t events_queued;
@@ -407,11 +412,12 @@ int evdi_gem_create(struct drm_file *file, struct drm_device *dev, uint64_t size
 int evdi_dumb_create(struct drm_file *file, struct drm_device *dev, struct drm_mode_create_dumb *args);
 int evdi_drm_gem_mmap(struct file *filp, struct vm_area_struct *vma);
 void evdi_gem_free_object(struct drm_gem_object *gem_obj);
+int evdi_gem_cache_init(void);
+void evdi_gem_cache_cleanup(void);
 uint32_t evdi_gem_object_handle_lookup(struct drm_file *filp, struct drm_gem_object *obj);
 struct sg_table *evdi_prime_get_sg_table(struct drm_gem_object *obj);
 struct drm_gem_object *evdi_gem_prime_import(struct drm_device *dev,
 					     struct dma_buf *dma_buf);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
 int evdi_prime_handle_to_fd(struct drm_device *dev,
     struct drm_file *file_priv,
     uint32_t handle,
@@ -421,7 +427,6 @@ int evdi_prime_fd_to_handle(struct drm_device *dev,
     struct drm_file *file_priv,
     int prime_fd,
     uint32_t *handle);
-#endif
 
 #if KERNEL_VERSION(4, 17, 0) <= LINUX_VERSION_CODE
 vm_fault_t evdi_gem_fault(struct vm_fault *vmf);
@@ -438,6 +443,8 @@ struct drm_framebuffer *evdi_fb_user_fb_create(
 					struct drm_device *dev,
 					struct drm_file *file,
 					const struct drm_mode_fb_cmd2 *mode_cmd);
+int evdi_fb_cache_init(void);
+void evdi_fb_cache_cleanup(void);
 
 #define to_evdi_fb(x) container_of(x, struct evdi_framebuffer, base)
 
@@ -465,6 +472,16 @@ static __always_inline bool evdi_likely_connected(struct evdi_device *evdi, int 
 static __always_inline bool evdi_likely_not_stopping(struct evdi_device *evdi)
 {
 	return likely(!atomic_read(&evdi->events.stopping));
+}
+
+static __always_inline bool evdi_swap_file_pending(struct drm_file *file)
+{
+	struct evdi_file_priv *priv;
+
+	priv = file ? file->driver_priv : NULL;
+	if (unlikely(!priv))
+		return false;
+	return READ_ONCE(priv->pending_swaps) != 0;
 }
 
 /* Memory barriers */
@@ -500,6 +517,12 @@ static __always_inline void evdi_smp_mb(void)
 #define EVDI_HAVE_CONNECTOR_INIT_WITH_DDC 1
 #else
 #define EVDI_HAVE_CONNECTOR_INIT_WITH_DDC 0
+#endif
+
+#if KERNEL_VERSION(4, 16, 0) <= LINUX_VERSION_CODE
+#define EVDI_HAVE_KMEM_USERCOPY 1
+#else
+#define EVDI_HAVE_KMEM_USERCOPY 0
 #endif
 
 #define EVDI_MAX_INFLIGHT_REQUESTS 1000
@@ -584,6 +607,28 @@ static __always_inline void evdi_wakeup_pollers(struct evdi_device *evdi)
 	if (atomic_cmpxchg(&evdi->events.wake_pending, 0, 1) != 0)
 		return;
 #endif
+	evdi_smp_wmb();
+	if (likely(waitqueue_active(&evdi->events.wait_queue)))
+		wake_up_interruptible(&evdi->events.wait_queue);
+	EVDI_PERF_INC64(&evdi_perf.wakeup_count);
+}
+
+static __always_inline void evdi_wakeup_mailbox_pollers(struct evdi_device *evdi)
+{
+	if (unlikely(!evdi))
+		return;
+
+	if (unlikely(!waitqueue_active(&evdi->events.wait_queue)))
+		return;
+
+#ifdef EVDI_HAVE_ATOMIC_CMPXCHG_RELAXED
+	if (atomic_cmpxchg_relaxed(&evdi->events.mailbox_wake_pending, 0, 1) != 0)
+		return;
+#else
+	if (atomic_cmpxchg(&evdi->events.mailbox_wake_pending, 0, 1) != 0)
+		return;
+#endif
+
 	evdi_smp_wmb();
 	if (likely(waitqueue_active(&evdi->events.wait_queue)))
 		wake_up_interruptible(&evdi->events.wait_queue);

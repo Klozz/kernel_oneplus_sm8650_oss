@@ -19,7 +19,6 @@
 #include <linux/compat.h>
 #include <linux/sched/signal.h>
 #include <linux/errno.h>
-#include <linux/cpu_boost.h>
 
 static int evdi_queue_create_event_with_id(struct evdi_device *evdi, struct drm_evdi_gbm_create_buff *params, struct drm_file *owner, int poll_id);
 int evdi_queue_destroy_event(struct evdi_device *evdi, int id, struct drm_file *owner);
@@ -29,30 +28,73 @@ struct evdi_gralloc_buf_stack {
 	int installed_fds[EVDI_MAX_FDS];
 };
 
-static inline int evdi_get_unused_fds_batch(int n, int flags, int *fds)
+static __always_inline void evdi_put_unused_fds(int *fds, int nfd)
 {
-	int i, fd, ret = 0;
+	int i;
+
+	for (i = 0; i < nfd; i++)
+		put_unused_fd(fds[i]);
+}
+
+static __always_inline int evdi_get_unused_fds_batch(int n, int flags, int *fds)
+{
+	int i, fd;
 
 	prefetchw(fds);
 
 	if (unlikely(!fds || n <= 0))
-		return ret;
-
-	for (i = 0; i < n; i++)
-		fds[i] = -1;
+		return 0;
 
 	for (i = 0; i < n; i++) {
 		if (i + 1 < n)
 			prefetchw(&fds[i+1]);
 		fd = get_unused_fd_flags(flags);
 		if (unlikely(fd < 0)) {
-			ret = fd;
-			break;
+			evdi_put_unused_fds(fds, i);
+			return fd;
 		}
 		fds[i] = fd;
 	}
 
-	return ret;
+	return 0;
+}
+
+static __always_inline int evdi_gralloc_num_fds(const struct evdi_gralloc_data *gralloc)
+{
+	int nfd;
+
+	if (unlikely(!gralloc))
+		return 0;
+
+	nfd = READ_ONCE(gralloc->numFds);
+	if (nfd < 0)
+		return 0;
+	if (nfd > EVDI_MAX_FDS)
+		return EVDI_MAX_FDS;
+	return nfd;
+}
+
+static __always_inline void evdi_gralloc_put_files(struct evdi_gralloc_data *gralloc)
+{
+	int i, nfd = evdi_gralloc_num_fds(gralloc);
+
+	for (i = 0; i < nfd; i++) {
+		if (gralloc->data_files[i]) {
+			fput(gralloc->data_files[i]);
+			gralloc->data_files[i] = NULL;
+		}
+	}
+}
+
+static __always_inline void evdi_gralloc_install_files(struct evdi_gralloc_data *gralloc,
+			   const int *installed_fds, int nfd)
+{
+	int i;
+
+	for (i = 0; i < nfd; i++) {
+		fd_install(installed_fds[i], gralloc->data_files[i]);
+		gralloc->data_files[i] = NULL;
+	}
 }
 
 static int evdi_process_gralloc_buffer(struct evdi_inflight_req *req,
@@ -60,7 +102,7 @@ static int evdi_process_gralloc_buffer(struct evdi_inflight_req *req,
 					struct evdi_gralloc_buf_user *gralloc_buf)
 {
 	struct evdi_gralloc_data *gralloc;
-	int i, fd_tmp;
+	int fd_tmp, nfd;
 
 	gralloc = req->reply.get_buf.gralloc_buf.gralloc;
 	if (!gralloc)
@@ -73,24 +115,19 @@ static int evdi_process_gralloc_buffer(struct evdi_inflight_req *req,
 	gralloc_buf->version = gralloc->version;
 	gralloc_buf->numFds = gralloc->numFds;
 	gralloc_buf->numInts = gralloc->numInts;
+	nfd = gralloc_buf->numFds;
 	if (gralloc_buf->numInts) {
 		memcpy(&gralloc_buf->data[gralloc_buf->numFds],
 		       gralloc->data_ints,
 		       sizeof(int) * gralloc_buf->numInts);
 	}
 
-	fd_tmp = evdi_get_unused_fds_batch(gralloc_buf->numFds, O_RDWR, installed_fds);
-	if (unlikely(fd_tmp < 0)) {
-		for (i = 0; i < gralloc_buf->numFds; i++) {
-			if (installed_fds[i] >= 0)
-				put_unused_fd(installed_fds[i]);
-		}
+	fd_tmp = evdi_get_unused_fds_batch(nfd, O_RDWR, installed_fds);
+	if (unlikely(fd_tmp < 0))
 		return fd_tmp;
-	}
-	for (i = 0; i < gralloc_buf->numFds; i++) {
-		prefetchw(&gralloc_buf->data[i]);
-		gralloc_buf->data[i] = installed_fds[i];
-	}
+
+	if (nfd)
+		memcpy(gralloc_buf->data, installed_fds, sizeof(int) * nfd);
 
 	return 0;
 }
@@ -131,41 +168,16 @@ static inline struct evdi_inflight_req *evdi_inflight_alloc(struct evdi_device *
 						     int *out_id)
 {
 	struct evdi_inflight_req *req;
-	struct evdi_percpu_inflight *percpu_req;
-	bool from_percpu = false;
-	int id, i;
+	int id;
 
-	percpu_req = get_cpu_ptr(evdi->percpu_inflight);
-	if (likely(percpu_req)) {
-		prefetchw(&percpu_req->req[0]);
-		prefetchw(&percpu_req->req[1]);
-		for (i = 0; i < 2; i++) {
-			if (atomic_cmpxchg(&percpu_req->in_use[i], 0, 1) == 0) {
-				req = &percpu_req->req[i];
-				from_percpu = true;
-				memset(req, 0, sizeof(*req));
-				kref_init(&req->refcount);
-				init_completion(&req->done);
-				atomic_set(&req->freed, 0);
-				atomic_set(&req->from_percpu, 1);
-				req->percpu_slot = (u8)i;
-				req->reply.get_buf.gralloc_buf.gralloc = NULL;
-				EVDI_PERF_INC64(&evdi_perf.inflight_percpu_hits);
-				break;
-			}
-		}
-	}
-	put_cpu_ptr(percpu_req);
-
-	// fallback to mempool
-	if (!from_percpu) {
-		req = evdi_inflight_req_alloc(evdi);
-		if (likely(req))
-			EVDI_PERF_INC64(&evdi_perf.inflight_percpu_misses);
-	}
-
+	req = evdi_inflight_req_alloc(evdi);
 	if (unlikely(!req))
 		return NULL;
+
+	if (atomic_read(&req->from_percpu))
+		EVDI_PERF_INC64(&evdi_perf.inflight_percpu_hits);
+	else
+		EVDI_PERF_INC64(&evdi_perf.inflight_percpu_misses);
 
 	req->type = type;
 	req->owner = owner;
@@ -239,23 +251,7 @@ static struct evdi_inflight_req *evdi_inflight_take(struct evdi_device *evdi, in
 		return NULL;
 
 #ifdef EVDI_HAVE_XARRAY
-#ifdef EVDI_HAVE_ATOMIC_CMPXCHG_RELAXED
-	req = xa_load(&evdi->inflight_xa, id);
-	if (req) {
-		if (xa_cmpxchg(&evdi->inflight_xa, id, req, NULL, GFP_NOWAIT) != req)
-			req = NULL;
-	}
-#else
-	{
-		unsigned long flags;
-		xa_lock_irqsave(&evdi->inflight_xa, flags);
-		req = xa_load(&evdi->inflight_xa, id);
-		if (req)
-			xa_erase(&evdi->inflight_xa, id);
-
-		xa_unlock_irqrestore(&evdi->inflight_xa, flags);
-	}
-#endif
+	req = xa_erase(&evdi->inflight_xa, id);
 #else
 	spin_lock(&evdi->inflight_lock);
 	req = idr_find(&evdi->inflight_idr, id);
@@ -283,22 +279,9 @@ void evdi_inflight_discard_owner(struct evdi_device *evdi, struct drm_file *owne
 			if (req->owner != owner)
 				continue;
 
-#ifdef EVDI_HAVE_ATOMIC_CMPXCHG_RELAXED
 			if (xa_cmpxchg(&evdi->inflight_xa,
 				       xas.xa_index, req, NULL, GFP_NOWAIT) != req)
 				continue;
-#else
-			if (xa_lock_irqsave(&evdi->inflight_xa, flags),
-			    xa_for_each(&evdi->inflight_xa, idx, entry),
-			    req == entry)
-			{
-				req = xa_erase(&evdi->inflight_xa, xas.xa_index);
-				xa_unlock_irqrestore(&evdi->inflight_xa, flags);
-			} else {
-				xa_unlock_irqrestore(&evdi->inflight_xa, flags);
-				continue;
-			}
-#endif
 			rcu_read_unlock();
 			complete_all(&req->done);
 			evdi_inflight_req_put(req);
@@ -338,6 +321,7 @@ void evdi_inflight_discard_owner(struct evdi_device *evdi, struct drm_file *owne
 #endif
 }
 
+#if !EVDI_HAVE_KMEM_USERCOPY
 static inline size_t evdi_event_serialize_payload(struct evdi_event *e,
 						  void *out_buf,
 						  size_t out_buf_size)
@@ -353,6 +337,7 @@ static inline size_t evdi_event_serialize_payload(struct evdi_event *e,
 
 	return copy_size;
 }
+#endif
 
 static int evdi_queue_create_event_with_id(struct evdi_device *evdi,
 	   struct drm_evdi_gbm_create_buff *params,
@@ -501,6 +486,17 @@ int evdi_ioctl_connect(struct drm_device *dev, void *data, struct drm_file *file
 	return 0;
 }
 
+static __always_inline u64 evdi_swap_mailbox_seq_current(struct evdi_device *evdi,
+							 int display_id)
+{
+	if (unlikely(!evdi))
+		return 0;
+	if (unlikely(display_id < 0 || display_id >= LINDROID_MAX_CONNECTORS))
+		return 0;
+
+	return (u64)atomic64_read(&evdi->swap_mailbox[display_id].seq);
+}
+
 static __always_inline bool evdi_swap_mailbox_read_stable(struct evdi_device *evdi,
 							 int display_id,
 							 u64 *seq,
@@ -550,15 +546,57 @@ retry:
 	return true;
 }
 
+static __always_inline bool evdi_swap_try_dequeue_display(struct evdi_device *evdi,
+							  struct drm_file *file,
+							  struct evdi_file_priv *priv,
+							  int d,
+							  struct evdi_swap *out,
+							  int *out_poll_id)
+{
+	struct drm_file *owner;
+	int poll_id;
+	u64 seq, payload, latest;
+
+	if (!evdi_swap_mailbox_read_stable(evdi, d, &seq, &payload, &poll_id,
+					   &owner))
+		return false;
+
+	if (owner != file) {
+		clear_bit(d, &priv->pending_swaps);
+		return false;
+	}
+
+	if (seq == priv->last_swap_seq[d]) {
+		latest = evdi_swap_mailbox_seq_current(evdi, d);
+		if (!(latest & 1) && latest == seq)
+			clear_bit(d, &priv->pending_swaps);
+		return false;
+	}
+
+	priv->last_swap_seq[d] = seq;
+	priv->swap_rr = (u8)(d + 1);
+	if (priv->swap_rr >= LINDROID_MAX_CONNECTORS)
+		priv->swap_rr = 0;
+
+	out->id = (int)(u32)(payload >> 32);
+	out->display_id = (int)(u32)payload;
+	*out_poll_id = poll_id;
+
+	latest = evdi_swap_mailbox_seq_current(evdi, d);
+	if (!(latest & 1) && latest == seq)
+		clear_bit(d, &priv->pending_swaps);
+
+	return true;
+}
+
 static __always_inline bool evdi_swap_dequeue_for_file(struct evdi_device *evdi,
 						       struct drm_file *file,
 						       struct evdi_swap *out,
 						       int *out_poll_id)
 {
+	unsigned long pending;
 	struct evdi_file_priv *priv;
-	struct drm_file *owner;
-	int start, i, poll_id, d;
-	u64 seq, payload;
+	int start, d;
 
 	if (unlikely(!evdi || !file || !out || !out_poll_id))
 		return false;
@@ -567,25 +605,28 @@ static __always_inline bool evdi_swap_dequeue_for_file(struct evdi_device *evdi,
 	if (unlikely(!priv))
 		return false;
 
-	start = (int)(priv->swap_rr % LINDROID_MAX_CONNECTORS);
-	for (i = 0; i < LINDROID_MAX_CONNECTORS; i++) {
-		d = (start + i) % LINDROID_MAX_CONNECTORS;
+	pending = READ_ONCE(priv->pending_swaps);
+	if (!pending)
+		return false;
 
-		if (!evdi_swap_mailbox_read_stable(evdi, d, &seq, &payload, &poll_id, &owner))
+	start = (int)READ_ONCE(priv->swap_rr);
+	if (unlikely(start >= LINDROID_MAX_CONNECTORS))
+		start = 0;
+
+	for (d = start; d < LINDROID_MAX_CONNECTORS; d++) {
+		if (!test_bit(d, &pending))
 			continue;
+		if (evdi_swap_try_dequeue_display(evdi, file, priv, d, out,
+						  out_poll_id))
+			return true;
+	}
 
-		if (owner != file)
+	for (d = 0; d < start; d++) {
+		if (!test_bit(d, &pending))
 			continue;
-		if (seq == priv->last_swap_seq[d])
-			continue;
-
-		priv->last_swap_seq[d] = seq;
-		priv->swap_rr = (u8)((d + 1) % LINDROID_MAX_CONNECTORS);
-
-		out->id = (int)(u32)(payload >> 32);
-		out->display_id = (int)(u32)payload;
-		*out_poll_id = poll_id;
-		return true;
+		if (evdi_swap_try_dequeue_display(evdi, file, priv, d, out,
+						  out_poll_id))
+			return true;
 	}
 
 	return false;
@@ -600,7 +641,9 @@ int evdi_ioctl_poll(struct drm_device *dev, void *data, struct drm_file *file)
 	size_t payload_size;
 	int ret, poll_id;
 
+#if !EVDI_HAVE_KMEM_USERCOPY
 	u8 payload_buf[EVDI_EVENT_PAYLOAD_MAX];
+#endif
 
 	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[1]);
 
@@ -643,16 +686,26 @@ int evdi_ioctl_poll(struct drm_device *dev, void *data, struct drm_file *file)
 
 deliver:
 	cmd->event = event->type;
-	cpu_boost_kick(4);
 	cmd->poll_id = event->poll_id;
 
+#if EVDI_HAVE_KMEM_USERCOPY
+	payload_size = min_t(size_t, READ_ONCE(event->payload_size),
+			     sizeof(event->payload));
+#else
 	payload_size = evdi_event_serialize_payload(event,
 			payload_buf, sizeof(payload_buf));
+#endif
 
 	if (payload_size && cmd->data) {
+#if EVDI_HAVE_KMEM_USERCOPY
+		if (evdi_copy_to_user_allow_partial(cmd->data,
+						    event->payload,
+						    payload_size)) {
+#else
 		if (evdi_copy_to_user_allow_partial(cmd->data,
 						    payload_buf,
 						    payload_size)) {
+#endif
 		evdi_event_free(event);
 		return -EFAULT;
 		}
@@ -671,11 +724,18 @@ int evdi_ioctl_gbm_get_buff(struct drm_device *dev, void *data, struct drm_file 
 	struct evdi_gralloc_buf_stack stack_buf;
 	struct evdi_gralloc_buf_user *gralloc_buf;
 	struct evdi_gralloc_data *gralloc;
+	void __user *u_native_handle;
 	int poll_id;
 	long ret;
-	int i, nfd, copy_size;
+	int nfd, copy_size;
 
 	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[7]);
+
+	u_native_handle = cmd->native_handle;
+	if (!u_native_handle ||
+	    !evdi_access_ok_write(u_native_handle,
+				  sizeof(struct evdi_gralloc_buf_user)))
+		return -EFAULT;
 
 	req = evdi_inflight_alloc(evdi, file, get_buf, &poll_id);
 	if (!req)
@@ -713,54 +773,26 @@ int evdi_ioctl_gbm_get_buff(struct drm_device *dev, void *data, struct drm_file 
 	}
 
 	gralloc = req->reply.get_buf.gralloc_buf.gralloc;
-	copy_size = sizeof(int) * (3 + gralloc_buf->numFds + gralloc_buf->numInts);
+	nfd = gralloc_buf->numFds;
+	copy_size = sizeof(int) * (3 + nfd + gralloc_buf->numInts);
 	if (gralloc)
 		prefetch(gralloc);
 
-	if (evdi_copy_to_user_allow_partial(cmd->native_handle, gralloc_buf, copy_size)) {
-		for (i = 0; i < gralloc_buf->numFds; i++)
-			put_unused_fd(stack_buf.installed_fds[i]);
-
+	if (evdi_copy_to_user_allow_partial(u_native_handle, gralloc_buf, copy_size)) {
+		evdi_put_unused_fds(stack_buf.installed_fds, nfd);
 		ret = -EFAULT;
-		goto err_event;
+		goto out_put_files;
 	}
 
-	if (gralloc) {
-		nfd = gralloc_buf->numFds;
-		if (nfd < 0)
-			nfd = 0;
-		else if (nfd > EVDI_MAX_FDS)
-			nfd = EVDI_MAX_FDS;
-
-		for (i = 0; i < nfd; i++) {
-			if (gralloc->data_files[i])
-				fd_install(stack_buf.installed_fds[i], gralloc->data_files[i]);
-		}
-	}
+	evdi_gralloc_install_files(gralloc, stack_buf.installed_fds, nfd);
 
 	ret = 0;
-err_event:
-	if (gralloc) {
-		nfd = gralloc->numFds;
+	goto out_req_put;
 
-		if (nfd < 0)
-			nfd = 0;
-		else if (nfd > EVDI_MAX_FDS)
-			nfd = EVDI_MAX_FDS;
+out_put_files:
+	evdi_gralloc_put_files(gralloc);
 
-		if (ret) {
-			for (i = 0; i < nfd; i++) {
-				if (gralloc->data_files[i]) {
-					fput(gralloc->data_files[i]);
-					gralloc->data_files[i] = NULL;
-				}
-			}
-		} else {
-			for (i = 0; i < nfd; i++) {
-				gralloc->data_files[i] = NULL;
-			}
-		}
-	}
+out_req_put:
 	evdi_inflight_req_put(req);
 	return ret;
 }
@@ -934,18 +966,16 @@ int evdi_ioctl_get_buff_callback(struct drm_device *dev, void *data, struct drm_
 	struct evdi_device *evdi = dev->dev_private;
 	struct drm_evdi_get_buff_callabck *cb = data;
 	struct evdi_inflight_req *req;
-	struct evdi_gralloc_data *gralloc;
-	int i, j, nfd, nint;
+	struct evdi_gralloc_data *gralloc = NULL;
+	struct file *f;
+	int i, nfd, nint;
 	int fds_local[EVDI_MAX_FDS];
 
 	EVDI_PERF_INC64(&evdi_perf.ioctl_calls[3]);
 
 	req = evdi_inflight_take(evdi, cb->poll_id);
 	if (!req)
-		goto out_wake;
-
-//	if (req->owner != file)
-//		evdi_warn("get_buff_callback: poll_id %d owned by different file", cb->poll_id);
+		return 0;
 
 	if (cb->numFds < 0 || cb->numInts < 0 ||
 	    cb->numFds > EVDI_MAX_FDS || cb->numInts > EVDI_MAX_INTS)
@@ -958,8 +988,6 @@ int evdi_ioctl_get_buff_callback(struct drm_device *dev, void *data, struct drm_
 	if (!gralloc)
 		goto out_complete;
 
-	memset(gralloc, 0, sizeof(*gralloc));
-
 	gralloc->version = cb->version;
 	gralloc->numFds = 0;
 	gralloc->numInts = 0;
@@ -969,6 +997,7 @@ int evdi_ioctl_get_buff_callback(struct drm_device *dev, void *data, struct drm_
 						      cb->data_ints,
 						      sizeof(int) * nint)) {
 			mempool_free(gralloc, global_event_pool.gralloc_data_pool);
+			gralloc = NULL;
 			goto out_complete;
 		}
 		gralloc->numInts = nint;
@@ -978,22 +1007,19 @@ int evdi_ioctl_get_buff_callback(struct drm_device *dev, void *data, struct drm_
 		if (evdi_copy_from_user_allow_partial(fds_local, cb->fd_ints,
 						      sizeof(int) * nfd)) {
 			mempool_free(gralloc, global_event_pool.gralloc_data_pool);
+			gralloc = NULL;
 			goto out_complete;
 		}
 		for (i = 0; i < nfd; i++) {
-			gralloc->data_files[i] = fget(fds_local[i]);
-			if (!gralloc->data_files[i]) {
-				for (j = 0; j < i; j++) {
-					if (gralloc->data_files[j]) {
-						fput(gralloc->data_files[j]);
-						gralloc->data_files[j] = NULL;
-					}
-				}
+			f = fget(fds_local[i]);
+			if (!f) {
+				evdi_gralloc_put_files(gralloc);
 				mempool_free(gralloc, global_event_pool.gralloc_data_pool);
+				gralloc = NULL;
 				goto out_complete;
 			}
+			gralloc->data_files[gralloc->numFds++] = f;
 		}
-		gralloc->numFds = nfd;
 	}
 
 	req->reply.get_buf.gralloc_buf.gralloc = gralloc;
@@ -1001,10 +1027,6 @@ int evdi_ioctl_get_buff_callback(struct drm_device *dev, void *data, struct drm_
 out_complete:
 	complete_all(&req->done);
 	evdi_inflight_req_put(req);
-	goto out_wake;
-
-out_wake:
-	evdi_wakeup_pollers(evdi);
 	return 0;
 }
 
@@ -1079,6 +1101,7 @@ int evdi_queue_swap_event(struct evdi_device *evdi, int id, int display_id,
 {
 	struct drm_file *client;
 	struct evdi_swap_mailbox *mb;
+	struct evdi_file_priv *priv;
 	u32 current_generation;
 	u64 payload;
 	int poll_id;
@@ -1109,8 +1132,8 @@ int evdi_queue_swap_event(struct evdi_device *evdi, int id, int display_id,
 
 	mb = &evdi->swap_mailbox[display_id];
 	payload = evdi_swap_pack(id, display_id);
-
 	poll_id = atomic_inc_return(&evdi->events.next_poll_id);
+	priv = owner ? owner->driver_priv : NULL;
 
 	atomic64_inc(&mb->seq); // odd
 	WRITE_ONCE(mb->owner, owner);
@@ -1121,10 +1144,13 @@ int evdi_queue_swap_event(struct evdi_device *evdi, int id, int display_id,
 
 	EVDI_PERF_INC64(&evdi_perf.swap_updates);
 
-	// Swap events do not use the standard event queue! Do not use evdi_wakeup_pollers
-	// here or set wake pending!
-	evdi_smp_wmb();
-	wake_up_interruptible(&evdi->events.wait_queue);
+	if (priv) {
+		set_bit(display_id, &priv->pending_swaps);
+		smp_mb__after_atomic();
+	}
+
+	// Swap events do not use the standard event queue, so use a mailbox-specific helper
+	evdi_wakeup_mailbox_pollers(evdi);
 
 	return 0;
 }

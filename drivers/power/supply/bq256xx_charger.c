@@ -1801,8 +1801,6 @@ static int bq256xx_probe(struct i2c_client *client,
 			dev_err(dev, "get irq fail: %d\n", ret);
 			return ret;
 		}
-
-		enable_irq_wake(client->irq);
 	}
 
 	dev_dbg(dev, "bq256xx successfully probed. charger=0x%x\n",
