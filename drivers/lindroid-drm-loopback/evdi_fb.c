@@ -47,7 +47,7 @@ static struct evdi_framebuffer *evdi_fb_alloc(gfp_t gfp)
 
 static inline void evdi_gem_object_put_local(struct drm_gem_object *obj)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
 	drm_gem_object_put(obj);
 #else
 	drm_gem_object_put_unlocked(obj);
@@ -108,11 +108,6 @@ static int evdi_fb_calc_size(const struct drm_mode_fb_cmd2 *mode_cmd,
 
 	if (!mode_cmd->width || !mode_cmd->height)
 		return -EINVAL;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0))
-	if (mode_cmd->modifier[0] && mode_cmd->modifier[0] != DRM_FORMAT_MOD_LINEAR)
-		return -EINVAL;
-#endif
 
 	if (mode_cmd->pitches[0]) {
 		pitch = mode_cmd->pitches[0];
