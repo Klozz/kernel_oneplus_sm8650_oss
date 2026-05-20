@@ -102,6 +102,7 @@ obj-$(CONFIG_GH_CPUSYS_VM_MEM_ACCESS) += gh_cpusys_vm_mem_access.o
 obj-$(CONFIG_SPS) += sps/
 obj-$(CONFIG_QCOM_RAMDUMP) += qcom_ramdump.o
 obj-$(CONFIG_QCOM_ICC_BWMON)	+= icc-bwmon.o
+obj-$(CONFIG_QCOM_DCVS_BOOST_API)	+= dcvs_boost_api.o
 obj-$(CONFIG_QCOM_DCVS) += dcvs/
 obj-$(CONFIG_QCOM_CPUCP) += qcom_cpucp.o
 obj-$(CONFIG_MSM_RPM_SMD_DEBUG)   +=  rpm-smd-debug.o

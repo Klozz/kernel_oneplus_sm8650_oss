@@ -689,6 +689,15 @@ config MINIDUMP_ALL_TASK_INFO
 	  collection during panic. This can provide more
 	  debug info.
 
+config QCOM_DCVS_BOOST_API
+	bool "QCOM DCVS boost API bridge"
+	depends on QCOM_DCVS
+	default y if QCOM_DCVS_BOOST
+	help
+	  Build the public qcom_dcvs_bus_boost_kick*() bridge into vmlinux
+	  so built-in code can call it even when the DCVS boost provider is
+	  a module. Calls are no-ops until a provider registers.
+
 source "drivers/soc/qcom/dcvs/Kconfig"
 
 config QCOM_LOGBUF_VENDOR_HOOKS

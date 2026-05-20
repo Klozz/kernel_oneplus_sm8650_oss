@@ -350,7 +350,6 @@ struct amp_assoc {
 
 struct hci_dev {
 	struct list_head list;
-	struct srcu_struct srcu;
 	struct mutex	lock;
 
 	char		name[8];

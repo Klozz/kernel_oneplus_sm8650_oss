@@ -133,6 +133,19 @@
 
 #include "internal.h"
 
+#define CRITICAL_OOM_SCORE_ADJ	(-900)
+
+static __always_inline bool task_is_critical(void)
+{
+	if (current->flags & PF_KTHREAD)
+		return false;
+
+	if (unlikely(!current->signal))
+		return false;
+
+	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
+}
+
 /*
  * Initialise a struct file's readahead state.  Assumes that the caller has
  * memset *ra to zero.
@@ -260,6 +273,7 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 		folio = filemap_alloc_folio(gfp_mask, 0);
 		if (!folio)
 			break;
+		trace_android_vh_readahead_add_folio(folio, mapping);
 		if (filemap_add_folio(mapping, folio, index + i,
 					gfp_mask) < 0) {
 			folio_put(folio);
@@ -498,6 +512,7 @@ static inline int ra_alloc_folio(struct readahead_control *ractl, pgoff_t index,
 	mark = round_down(mark, 1UL << order);
 	if (index == mark)
 		folio_set_readahead(folio);
+	trace_android_vh_readahead_add_folio(folio, ractl->mapping);
 	err = filemap_add_folio(ractl->mapping, folio, index, gfp);
 	if (err) {
 		folio_put(folio);
@@ -521,6 +536,9 @@ void page_cache_ra_order(struct readahead_control *ractl,
 	gfp_t gfp = readahead_gfp_mask(mapping);
 
 	if (!mapping_large_folio_support(mapping) || ra->size < 4)
+		goto fallback;
+
+	if (task_is_critical())
 		goto fallback;
 
 	limit = min(limit, index + ra->size - 1);
@@ -832,6 +850,7 @@ void readahead_expand(struct readahead_control *ractl,
 		page = __page_cache_alloc(gfp_mask);
 		if (!page)
 			return;
+		trace_android_vh_readahead_add_folio(page_folio(page), mapping);
 		if (add_to_page_cache_lru(page, mapping, index, gfp_mask) < 0) {
 			put_page(page);
 			return;
@@ -855,6 +874,7 @@ void readahead_expand(struct readahead_control *ractl,
 		page = __page_cache_alloc(gfp_mask);
 		if (!page)
 			return;
+		trace_android_vh_readahead_add_folio(page_folio(page), mapping);
 		if (add_to_page_cache_lru(page, mapping, index, gfp_mask) < 0) {
 			put_page(page);
 			return;

@@ -219,7 +219,7 @@ static void dcvs_boost_worker(struct work_struct *work)
 	mutex_unlock(&boost_lock);
 }
 
-void qcom_dcvs_bus_boost_kick(unsigned int duration_ms)
+static void dcvs_boost_kick(unsigned int duration_ms)
 {
 	unsigned long now = jiffies;
 	unsigned long new_exp = now + msecs_to_jiffies(duration_ms);
@@ -253,9 +253,8 @@ void qcom_dcvs_bus_boost_kick(unsigned int duration_ms)
 		spin_unlock_irqrestore(&pending_lock, flags);
 	}
 }
-EXPORT_SYMBOL_GPL(qcom_dcvs_bus_boost_kick);
 
-void qcom_dcvs_bus_boost_kick_max(unsigned int duration_ms)
+static void dcvs_boost_kick_max(unsigned int duration_ms)
 {
 	unsigned long now = jiffies;
 	unsigned long new_exp = now + msecs_to_jiffies(duration_ms);
@@ -283,30 +282,42 @@ void qcom_dcvs_bus_boost_kick_max(unsigned int duration_ms)
 		spin_unlock_irqrestore(&pending_lock, flags);
 	}
 }
-EXPORT_SYMBOL_GPL(qcom_dcvs_bus_boost_kick_max);
+
+static const struct qcom_dcvs_boost_ops dcvs_boost_ops = {
+	.kick = dcvs_boost_kick,
+	.kick_max = dcvs_boost_kick_max,
+};
 
 static int __init dcvs_boost_init(void)
 {
+	int ret;
+
 	INIT_DELAYED_WORK(&boost_disable_work, dcvs_boost_worker);
 	BUILD_BUG_ON(NUM_DCVS_HW_TYPES > 32);
 	bitmap_zero(pending_hw, NUM_DCVS_HW_TYPES);
 	bitmap_zero(pending_max_hw, NUM_DCVS_HW_TYPES);
+
+	ret = qcom_dcvs_boost_register_ops(&dcvs_boost_ops);
+	if (ret)
+		return ret;
+
 	pr_info("initialized\n");
 	return 0;
 }
 
 static void __exit dcvs_boost_exit(void)
 {
+	qcom_dcvs_boost_unregister_ops(&dcvs_boost_ops);
+	cancel_delayed_work_sync(&boost_disable_work);
+
 	mutex_lock(&boost_lock);
 	if (!bitmap_empty(active_hw, NUM_DCVS_HW_TYPES))
 		(void)apply_votes(active_hw, true);
-
 	if (!bitmap_empty(active_max_hw, NUM_DCVS_HW_TYPES))
 		(void)apply_votes_max(active_max_hw, true);
 	bitmap_zero(active_hw, NUM_DCVS_HW_TYPES);
 	bitmap_zero(active_max_hw, NUM_DCVS_HW_TYPES);
 	mutex_unlock(&boost_lock);
-	cancel_delayed_work_sync(&boost_disable_work);
 }
 
 module_init(dcvs_boost_init);

@@ -559,6 +559,7 @@ struct page *__cma_alloc(struct cma *cma, unsigned long count,
 	pr_debug("%s(): returned %p\n", __func__, page);
 out:
 	trace_cma_alloc_finish(name, pfn, page, count, align);
+	trace_android_vh_cma_alloc_end(cma, pfn, page, count, align, ret);
 	if (page) {
 		count_vm_event(CMA_ALLOC_SUCCESS);
 		cma_sysfs_account_success_pages(cma, count);
@@ -623,6 +624,7 @@ bool cma_release(struct cma *cma, const struct page *pages,
 		 unsigned long count)
 {
 	unsigned long pfn;
+	bool bypass = false;
 
 	if (!cma_pages_valid(cma, pages, count))
 		return false;
@@ -633,10 +635,15 @@ bool cma_release(struct cma *cma, const struct page *pages,
 
 	VM_BUG_ON(pfn + count > cma->base_pfn + cma->count);
 
+	trace_android_vh_cma_release_bypass(cma, pages, count, &bypass);
+	if (bypass)
+		return true;
+
 	if (cma->gcma)
 		gcma_free_range(pfn, pfn + count - 1);
 	else
 		free_contig_range(pfn, count);
+
 	cma_clear_bitmap(cma, pfn, count);
 	trace_cma_release(cma->name, pfn, pages, count);
 

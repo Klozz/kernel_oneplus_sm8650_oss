@@ -20,8 +20,9 @@
 static LIST_HEAD(free_list);
 static size_t list_nr_pages;
 wait_queue_head_t freelist_waitqueue;
-struct task_struct *freelist_task;
 static DEFINE_SPINLOCK(free_list_lock);
+struct task_struct *freelist_task;
+EXPORT_SYMBOL_GPL(freelist_task);
 
 #define CRITICAL_OOM_SCORE_ADJ	(-900)
 
