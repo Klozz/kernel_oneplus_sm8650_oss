@@ -857,13 +857,19 @@ static s64 entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se, u64 avrunt
  * Similarly, check that the entity didn't gain positive lag when DELAY_ZERO
  * is set.
  *
- * Return true if the lag has been adjusted.
+ * Return true if the vlag has been modified. Specifically:
+ *
+ *   se->vlag != avg_vruntime() - se->vruntime
+ *
+ * This can be due to clamping in entity_lag() or clamping due to
+ * sched_delayed. Either way, when vlag is modified and the entity is
+ * retained, the tree needs to be adjusted.
  */
 static __always_inline
 bool update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	s64 vlag = entity_lag(cfs_rq, se, avg_vruntime(cfs_rq));
-	bool ret;
+	u64 avruntime = avg_vruntime(cfs_rq);
+	s64 vlag = entity_lag(cfs_rq, se, avruntime);
 
 	SCHED_WARN_ON(!se->on_rq);
 
@@ -873,10 +879,9 @@ bool update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		if (sched_feat(DELAY_ZERO))
 			vlag = min(vlag, 0);
 	}
-	ret = (vlag == se->vlag);
 	se->vlag = vlag;
 
-	return ret;
+	return avruntime - vlag != se->vruntime;
 }
 
 /*
@@ -1417,6 +1422,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	}
 
 	curr->sum_exec_runtime += delta_exec;
+	curr->delta_exec += delta_exec;
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
 	curr->vruntime += calc_delta_fair(delta_exec, curr);
@@ -4957,6 +4963,11 @@ static inline unsigned long task_util(struct task_struct *p)
 	return READ_ONCE(p->se.avg.util_avg);
 }
 
+static inline unsigned long task_util_dequeued(struct task_struct *p)
+{
+	return READ_ONCE(p->util_avg_dequeued);
+}
+
 static inline unsigned long task_runnable(struct task_struct *p)
 {
 	return READ_ONCE(p->se.avg.runnable_avg);
@@ -5011,6 +5022,7 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
 				   bool task_sleep)
 {
 	unsigned int ewma, dequeued, last_ewma_diff;
+	unsigned int util, diff, prev;
 	int ret = 0;
 
 	trace_android_rvh_util_est_update(cfs_rq, p, task_sleep, &ret);
@@ -5020,15 +5032,38 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
 	if (!sched_feat(UTIL_EST))
 		return;
 
-	/*
-	 * Skip update of task's estimated utilization when the task has not
-	 * yet completed an activation, e.g. being migrated.
-	 */
-	if (!task_sleep)
-		return;
-
 	/* Get current estimate of utilization */
 	ewma = READ_ONCE(p->se.avg.util_est);
+
+	if (!task_sleep) {
+		/*
+		 * Only project forward when the task is actually running
+		 * hotter than it was at its last dequeue. If util has not
+		 * grown past the dequeue snapshot by more than the margin,
+		 * the dequeue-time EWMA is still a good estimate.
+		 */
+		util = task_util(p);
+		if (util > task_util_dequeued(p) &&
+		    util - task_util_dequeued(p) > UTIL_EST_MARGIN) {
+			prev = ewma & ~UTIL_AVG_UNCHANGED;
+			if (prev < util) {
+				diff = util - prev;
+				ewma = prev + (diff >> UTIL_EST_WEIGHT_SHIFT);
+
+				/*
+				 * Keep accumulating delta_exec if it is too small
+				 * to cause a visible estimate change.
+				 */
+				if (ewma != prev) {
+					p->se.delta_exec = 0;
+					goto done_running;
+				}
+			}
+		}
+		return;
+	} else {
+		p->se.delta_exec = 0;
+	}
 
 	/*
 	 * If the PELT values haven't changed since enqueue time,
@@ -5039,6 +5074,9 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
 
 	/* Get utilization at dequeue */
 	dequeued = task_util(p);
+
+	if (!task_on_rq_migrating(p))
+		p->util_avg_dequeued = dequeued;
 
 	/*
 	 * Reset EWMA on utilization increases, the moving average is used only
@@ -5086,9 +5124,17 @@ static inline void util_est_update(struct cfs_rq *cfs_rq,
 	ewma >>= UTIL_EST_WEIGHT_SHIFT;
 done:
 	ewma |= UTIL_AVG_UNCHANGED;
-	WRITE_ONCE(p->se.avg.util_est, ewma);
-
 	trace_sched_util_est_se_tp(&p->se);
+done_running:
+	WRITE_ONCE(p->se.avg.util_est, ewma);
+}
+
+static inline void util_est_update_running(struct cfs_rq *cfs_rq,
+					   struct task_struct *p)
+{
+	util_est_dequeue(cfs_rq, p);
+	util_est_update(cfs_rq, p, false);
+	util_est_enqueue(cfs_rq, p);
 }
 
 static inline int util_fits_cpu(unsigned long util,
@@ -7344,6 +7390,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
+	int ret;
 	if (task_is_throttled(p)) {
 		dequeue_throttled_task(p, flags);
 		return true;
@@ -7352,8 +7399,9 @@ static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!p->se.sched_delayed)
 		util_est_dequeue(&rq->cfs, p);
 
+	ret = dequeue_entities(rq, &p->se, flags);
 	util_est_update(&rq->cfs, p, flags & DEQUEUE_SLEEP);
-	if (dequeue_entities(rq, &p->se, flags) < 0)
+	if (ret < 0)
 		return false;
 
 	/*
@@ -9060,6 +9108,8 @@ again:
 simple:
 #endif
 	put_prev_set_next_task(rq, prev, p);
+	if (prev->on_rq)
+		util_est_update_running(&rq->cfs, prev);
 	return p;
 
 idle:
@@ -9674,6 +9724,15 @@ static int detach_tasks(struct lb_env *env)
 	int detached = 0;
 
 	lockdep_assert_rq_held(env->src_rq);
+
+	/*
+	 * Source run queue has been emptied by another CPU, clear
+	 * LBF_ALL_PINNED flag as we will not test any task.
+	 */
+	if (env->src_rq->nr_running <= 1) {
+		env->flags &= ~LBF_ALL_PINNED;
+		return 0;
+	}
 
 	/*
 	 * Source run queue has been emptied by another CPU, clear
@@ -12476,6 +12535,13 @@ static void kick_ilb(unsigned int flags)
 		return;
 
 	/*
+	 * Don't bother if no new NOHZ balance work items for ilb_cpu,
+	 * i.e. all bits in flags are already set in ilb_cpu.
+	 */
+	if ((atomic_read(nohz_flags(ilb_cpu)) & flags) == flags)
+		return;
+
+	/*
 	 * Access to rq::nohz_csd is serialized by NOHZ_KICK_MASK; he who sets
 	 * the first flag owns it; cleared by nohz_csd_func().
 	 */
@@ -13459,6 +13525,8 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 		cfs_rq = cfs_rq_of(se);
 		entity_tick(cfs_rq, se, queued);
 	}
+
+	util_est_update_running(&rq->cfs, curr);
 
 	if (queued)
 		return;

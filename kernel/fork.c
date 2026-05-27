@@ -2889,8 +2889,13 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 
 	/* Boost CPUs to the max for 50 ms when userspace launches an app */
 	if (task_is_zygote(current) && kp_active_mode() != 1) {
-		cpu_boost_max(50);
-		qcom_dcvs_bus_boost_kick_max(50);
+		if (kp_active_mode() == 3) {
+			qcom_dcvs_bus_boost_kick_max(50);
+			cpu_boost_max(50);
+		} else {
+			qcom_dcvs_bus_boost_kick(25);
+			cpu_boost_kick(25);
+		}
 	}
 
 	/*
