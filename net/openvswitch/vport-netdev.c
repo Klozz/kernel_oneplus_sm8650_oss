@@ -188,7 +188,7 @@ void ovs_netdev_tunnel_destroy(struct vport *vport)
 	 * if it's not already shutting down.
 	 */
 	if (vport->dev->reg_state == NETREG_REGISTERED)
-		rtnl_delete_link(vport->dev, 0, NULL);
+		rtnl_delete_link(vport->dev);
 
 	/* We can't put the device reference yet, since it can still be in
 	 * use, but rtnl_unlock()->netdev_run_todo() will block until all
