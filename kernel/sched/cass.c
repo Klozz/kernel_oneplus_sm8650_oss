@@ -25,6 +25,14 @@
  * satisfy the overall load at any given moment.
  */
 
+/*
+ * Small-task packing: when a task is smaller than CASS_IDLE_ENOUGH_THRES
+ * percent of max capacity, prefer packing it onto an already-active CPU with
+ * the lowest original capacity. This keeps bigger/faster cores idle when not
+ * needed, improving energy efficiency.
+ */
+#define CASS_IDLE_ENOUGH_THRES		30
+
 struct cass_cpu_cand {
 	int cpu;
 	unsigned int exit_lat;
@@ -32,6 +40,7 @@ struct cass_cpu_cand {
 	unsigned long cap_max;
 	unsigned long cap_no_therm;
 	unsigned long cap_orig;
+	unsigned long therm_press;
 	unsigned long eff_util;
 	unsigned long hard_util;
 	unsigned long util;
@@ -101,9 +110,12 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 #define cass_cmp(a, b) ({ res = (a) - (b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
 	long res;
+	unsigned long hyst;
+	long util_diff;
 
 	/* Prefer the CPU that's not overloaded */
-	if (cass_cmp(b->eff_util / b->cap_max, a->eff_util / a->cap_max))
+	if (cass_cmp((u64)b->eff_util * a->cap_max,
+		     (u64)a->eff_util * b->cap_max))
 		goto done;
 
 	/* Prefer the CPU that's less overloaded if they're both overloaded */
@@ -125,9 +137,40 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 	if (cass_cmp(b->util, a->util))
 		goto done;
 
-	/* Prefer the CPU that is idle (only relevant for uclamped tasks) */
-	if (cass_cmp(!!a->exit_lat, !!b->exit_lat))
+	/* Prefer shallower idle state (lower exit latency) */
+	if (a->exit_lat && b->exit_lat &&
+	    cass_cmp(b->exit_lat, a->exit_lat))
 		goto done;
+
+	/* Prefer the CPU that is less thermally throttled */
+	util_diff = (long)a->util - (long)b->util;
+	if (util_diff < 0)
+		util_diff = -util_diff;
+
+	if (util_diff <= (long)(SCHED_CAPACITY_SCALE / 32)) { //~3%
+		if (cass_cmp(b->therm_press, a->therm_press))
+			goto done;
+	}
+
+	/*
+	 * When both CPUs are idle, keep the previous CPU slightly stickier:
+	 * require a small relative-util advantage to move away from it.
+	 */
+	if (a->exit_lat && b->exit_lat) {
+		hyst = SCHED_CAPACITY_SCALE / 64; //~1.5%
+
+		if (a->cpu == prev_cpu && b->cpu != prev_cpu &&
+		    a->util <= b->util + hyst) {
+			res = 1;
+			goto done;
+		}
+
+		if (b->cpu == prev_cpu && a->cpu != prev_cpu &&
+		    b->util <= a->util + hyst) {
+			res = -1;
+			goto done;
+		}
+	}
 
 	/* Prefer the current CPU for sync wakes */
 	if (sync && (cass_eq(a->cpu, this_cpu) || !cass_cmp(b->cpu, this_cpu)))
@@ -135,10 +178,6 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 
 	/* Prefer the CPU with higher capacity */
 	if (cass_cmp(a->cap, b->cap))
-		goto done;
-
-	/* Prefer the CPU with lower idle exit latency */
-	if (cass_cmp(b->exit_lat, a->exit_lat))
 		goto done;
 
 	/* Prefer the previous CPU */
@@ -156,21 +195,71 @@ done:
 	return res > 0;
 }
 
+/*
+ * Pack a small task onto the lowest-capacity active CPU that has spare cap
+ */
+static int cass_find_packing_cpu(struct task_struct *p, int prev_cpu,
+				 unsigned long p_util)
+{
+	const struct cpumask *allowed_mask = p->cpus_ptr;
+	int cpu, packing_cpu = -1;
+	unsigned long best_cap = ULONG_MAX;
+
+	/* Don't pack large tasks */
+	if (p_util >= CASS_IDLE_ENOUGH_THRES * SCHED_CAPACITY_SCALE / 100)
+		return -1;
+
+	/* Find the lowest-capacity active CPU with spare capacity */
+	for_each_cpu_and(cpu, cpu_active_mask, allowed_mask) {
+		unsigned long cpu_cap, cpu_cap_orig, freq_cap;
+
+		/* No benefit in waking an idle CPU for packing */
+		if (available_idle_cpu(cpu))
+			continue;
+
+		/* Skip CPUs already running at high frequency */
+		freq_cap = arch_scale_freq_capacity(cpu);
+		if (freq_cap > SCHED_CAPACITY_SCALE * 45 / 100)
+			continue;
+
+		/* Get available capacity after thermal pressure */
+		cpu_cap_orig = capacity_orig_of(cpu);
+		cpu_cap = cpu_cap_orig - thermal_load_avg(cpu_rq(cpu));
+		if (cpu_cap < p_util)
+			continue;
+
+		/* Prefer lowest original capacity for energy efficiency */
+		if (cpu_cap_orig >= best_cap)
+			continue;
+
+		best_cap = cpu_cap_orig;
+		packing_cpu = cpu;
+	}
+
+	return packing_cpu;
+}
+
 static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt)
 {
 	/* Initialize @best such that @best always has a valid CPU at the end */
 	struct cass_cpu_cand cands[2], *best = cands;
 	int this_cpu = raw_smp_processor_id();
-	unsigned long p_util, uc_min;
+	unsigned long p_util;
 	bool has_idle = false;
 	int cidx = 0, cpu;
 
-	/*
-	 * Get the utilization and uclamp minimum threshold for this task. Note
-	 * that RT tasks don't have per-entity load tracking.
+	 /*
+	 * Get the utilization for this task. Note that RT tasks don't have
+	 * per-entity load tracking.
 	 */
 	p_util = rt ? 0 : task_util_est(p);
-	uc_min = uclamp_eff_value(p, UCLAMP_MIN);
+
+	/* Attempt cluster packing for energy efficiency on lightly loaded systems */
+	if (!rt) {
+		int pack_cpu = cass_find_packing_cpu(p, prev_cpu, p_util);
+		if (pack_cpu >= 0)
+			return pack_cpu;
+	}
 
 	/*
 	 * Find the best CPU to wake @p on. Although idle_get_state() requires
@@ -194,10 +283,10 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 
 		/* Get the _current_, throttled maximum capacity of this CPU */
 		curr->cap_max = curr->cap_orig - thermal_load_avg(rq);
-
-		/* Prefer the CPU that more closely meets the uclamp minimum */
-		if (curr->cap_max < uc_min && curr->cap_max < best->cap_max)
-			continue;
+		if (curr->cap_max >= curr->cap_orig)
+			curr->therm_press = 0;
+		else
+			curr->therm_press = curr->cap_orig - curr->cap_max;
 
 		/*
 		 * Check if this CPU is idle or only has SCHED_IDLE tasks. For
@@ -209,14 +298,10 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		    choose_idle_cpu(cpu, p)) {
 			/*
 			 * A non-idle candidate may be better for energy
-			 * efficiency when @p is uclamp boosted above @curr's
-			 * minimum capacity, or when the only idle candidate
-			 * found so far is the prime CPU. Otherwise, prefer idle
-			 * candidates.
+			 * efficiency when the only idle candidate found so far
+			 * is the prime CPU. Otherwise, prefer idle candidates.
 			 */
-			if (!has_idle &&
-			    uc_min <= arch_scale_min_freq_capacity(cpu) &&
-			    !cass_prime_cpu(curr)) {
+			if (!has_idle && !cass_prime_cpu(curr)) {
 				/* Discard any previous non-idle candidate */
 				best = curr;
 				has_idle = true;
@@ -256,11 +341,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * overloaded, since the relative utilization calculation
 		 * disregards thermal pressure.
 		 */
-		curr->eff_util = max(curr->util + curr->hard_util, uc_min);
-
-		/* Clamp the utilization to the minimum performance threshold */
-		if (curr->util < uc_min)
-			curr->util = uc_min;
+		curr->eff_util = curr->util + curr->hard_util;
 
 		/*
 		 * Calculate the relative utilization for this CPU candidate

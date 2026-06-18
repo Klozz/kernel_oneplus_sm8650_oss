@@ -229,9 +229,14 @@ struct evdi_gem_object {
 #endif
 	bool vmap_is_vmram;
 	struct sg_table *sg;
+	struct file* dmabuf_file;
+	u32 gralloc_id;
 };
 
-#define to_evdi_bo(x) container_of(x, struct evdi_gem_object, base)
+static inline struct evdi_gem_object *to_evdi_gem(struct drm_gem_object *obj)
+{
+	return container_of(obj, struct evdi_gem_object, base);
+}
 
 struct evdi_swap {
 	int id;
@@ -283,16 +288,6 @@ struct evdi_display {
 };
 
 struct evdi_file_priv {
-	struct mutex lock;
-#ifdef EVDI_HAVE_XARRAY
-	struct xarray bufid_to_handle;
-	struct xarray handle_to_bufid;
-	u32 next_handle;
-#else
-	struct idr bufid_to_handle;
-	struct idr handle_to_bufid;
-	u32 next_handle;
-#endif
 	u64 last_swap_payload[LINDROID_MAX_CONNECTORS];
 	u8 swap_rr;
 	unsigned long pending_swaps;
@@ -428,7 +423,6 @@ int evdi_drm_gem_mmap(struct file *filp, struct vm_area_struct *vma);
 void evdi_gem_free_object(struct drm_gem_object *gem_obj);
 int evdi_gem_cache_init(void);
 void evdi_gem_cache_cleanup(void);
-uint32_t evdi_gem_object_handle_lookup(struct drm_file *filp, struct drm_gem_object *obj);
 struct sg_table *evdi_prime_get_sg_table(struct drm_gem_object *obj);
 struct drm_gem_object *evdi_gem_prime_import(struct drm_device *dev,
 					     struct dma_buf *dma_buf);

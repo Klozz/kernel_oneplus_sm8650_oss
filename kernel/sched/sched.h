@@ -669,8 +669,11 @@ static inline int rt_bandwidth_enabled(void)
 	return sysctl_sched_rt_runtime >= 0;
 }
 
-/* RT IPI pull logic requires IRQ_WORK */
-#if defined(CONFIG_IRQ_WORK) && defined(CONFIG_SMP)
+/* RT IPI pull logic requires IRQ_WORK
+ * This is best for PREEMPT_RT, but for non-RT it can cause issues
+ * when preemption is disabled for long periods of time. Have
+ * it only default enabled for PREEMPT_RT. */
+#if defined(CONFIG_IRQ_WORK) && defined(CONFIG_SMP) && defined(CONFIG_PREEMPT_RT)
 # define HAVE_RT_PUSH_IPI
 #endif
 
