@@ -342,10 +342,22 @@ static bool psi_recent_enough(void)
 	       time_before(jiffies, last + window * 2U);
 }
 
+static bool mem_available_too_low(void)
+{
+	long avail = si_mem_available();
+	unsigned long total = totalram_pages();
+
+	if (avail < 0)
+		return false;
+
+	/* 12.5% of total RAM: total / 8 */
+	return avail < (long)(total >> 3);
+}
+
 static int simple_lmk_vmpressure_cb(struct notifier_block *nb,
 				    unsigned long pressure, void *data)
 {
-	if (pressure >= 80 && psi_recent_enough())
+	if (pressure >= 60 && psi_recent_enough())
 		wake_reclaim_thread();
 	return NOTIFY_OK;
 }
@@ -390,6 +402,10 @@ static int simple_lmk_psi_thread(void *data)
 		now = jiffies;
 
 		WRITE_ONCE(last_psi_event, now);
+
+		/* Fallback for slow-ramp OOM */
+		if (!atomic_read(&needs_reclaim) && mem_available_too_low())
+			wake_reclaim_thread();
 	}
 
 	return 0;

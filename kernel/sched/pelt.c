@@ -26,13 +26,15 @@
 
 /*
  * Approximate:
- *   val * y^n,    where y^32 ~= 0.5 (~1 scheduling period)
+ *   val * y^n,    where y^16 ~= 0.5 (~1 scheduling period)
  */
-static u64 decay_load(u64 val, u64 n)
+static u64 decay_load(u64 val, u64 n, bool fast)
 {
 	unsigned int local_n;
+	u32 period = fast ? LOAD_AVG_PERIOD_FAST : LOAD_AVG_PERIOD;
+	const u32 *table = fast ? runnable_avg_yN_inv_fast : runnable_avg_yN_inv;
 
-	if (unlikely(n > LOAD_AVG_PERIOD * 63))
+	if (unlikely(n > period * 63))
 		return 0;
 
 	/* after bounds checking we can collapse to 32-bit */
@@ -45,23 +47,24 @@ static u64 decay_load(u64 val, u64 n)
 	 *
 	 * To achieve constant time decay_load.
 	 */
-	if (unlikely(local_n >= LOAD_AVG_PERIOD)) {
-		val >>= local_n / LOAD_AVG_PERIOD;
-		local_n %= LOAD_AVG_PERIOD;
+	if (unlikely(local_n >= period)) {
+		val >>= local_n / period;
+		local_n %= period;
 	}
 
-	val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);
+	val = mul_u64_u32_shr(val, table[local_n], 32);
 	return val;
 }
 
-static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
+static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3, bool fast)
 {
 	u32 c1, c2, c3 = d3; /* y^0 == 1 */
+	u32 max = fast ? LOAD_AVG_MAX_FAST : LOAD_AVG_MAX;
 
 	/*
 	 * c1 = d1 y^p
 	 */
-	c1 = decay_load((u64)d1, periods);
+	c1 = decay_load((u64)d1, periods, fast);
 
 	/*
 	 *            p-1
@@ -72,7 +75,7 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
 	 *    = 1024 ( \Sum y^n - \Sum y^n - y^0 )
 	 *              n=0        n=p
 	 */
-	c2 = LOAD_AVG_MAX - decay_load(LOAD_AVG_MAX, periods) - 1024;
+	c2 = max - decay_load(max, periods, fast) - 1024;
 
 	return c1 + c2 + c3;
 }
@@ -112,10 +115,12 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 	 * Step 1: decay old *_sum if we crossed period boundaries.
 	 */
 	if (periods) {
-		sa->load_sum = decay_load(sa->load_sum, periods);
+		bool fast = !running;
+
+		sa->load_sum = decay_load(sa->load_sum, periods, fast);
 		sa->runnable_sum =
-			decay_load(sa->runnable_sum, periods);
-		sa->util_sum = decay_load((u64)(sa->util_sum), periods);
+			decay_load(sa->runnable_sum, periods, fast);
+		sa->util_sum = decay_load((u64)(sa->util_sum), periods, fast);
 
 		/*
 		 * Step 2
@@ -133,7 +138,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 			 * so no point in calculating it.
 			 */
 			contrib = __accumulate_pelt_segments(periods,
-					1024 - sa->period_contrib, delta);
+					1024 - sa->period_contrib, delta, fast);
 		}
 	}
 	sa->period_contrib = delta;
@@ -165,9 +170,9 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  *   u_0 + u_1*y + u_2*y^2 + u_3*y^3 + ...
  *
  * We choose y based on the with of a reasonably scheduling period, fixing:
- *   y^32 = 0.5
+ *   y^16 = 0.5
  *
- * This means that the contribution to load ~32ms ago (u_32) will be weighted
+ * This means that the contribution to load ~16ms ago (u_16) will be weighted
  * approximately half as much as the contribution to load within the last ms
  * (u_0).
  *
