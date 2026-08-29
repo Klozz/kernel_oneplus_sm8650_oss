@@ -49,6 +49,7 @@
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/sched_task_critical.h>
 #include <linux/mutex.h>
 #include <linux/nsproxy.h>
 #include <linux/poll.h>
@@ -80,6 +81,16 @@
 #include <trace/hooks/binder.h>
 
 #include "../../kernel/sched/sched.h"
+
+#include <linux/cpu_boost.h>
+#include <soc/qcom/dcvs_boost.h>
+
+extern int kp_active_mode(void);
+
+static __always_inline bool task_is_critical(void)
+{
+	return sched_task_critical(current);
+}
 
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
@@ -658,6 +669,10 @@ static void binder_wakeup_thread_ilocked(struct binder_proc *proc,
 {
 	assert_spin_locked(&proc->inner_lock);
 
+	/* Force sync wakeup when the sender is a critical task */
+	if (task_is_critical())
+		sync = true;
+
 	if (thread) {
 		trace_android_vh_binder_wakeup_ilocked(thread->task, sync, proc);
 		if (sync)
@@ -893,7 +908,8 @@ static void binder_transaction_priority(struct binder_thread *thread,
 	if (skip)
 		return;
 
-	if (!node->inherit_rt && is_rt_policy(desired.sched_policy)) {
+	if (!task_is_critical() &&
+	    !node->inherit_rt && is_rt_policy(desired.sched_policy)) {
 		desired.prio = NICE_TO_PRIO(0);
 		desired.sched_policy = SCHED_NORMAL;
 	}
@@ -932,7 +948,10 @@ static void binder_transaction_priority(struct binder_thread *thread,
 	}
 	spin_unlock(&thread->prio_lock);
 
-	binder_set_priority(thread, &desired);
+	if (task_is_critical())
+		binder_do_set_priority(thread, &desired, false);
+	else
+		binder_set_priority(thread, &desired);
 	trace_android_vh_binder_set_priority(t, task);
 }
 
@@ -1907,7 +1926,20 @@ static void binder_txn_latency_free(struct binder_transaction *t)
 
 static void binder_free_transaction(struct binder_transaction *t)
 {
-	struct binder_proc *target_proc = t->to_proc;
+	struct binder_thread *target_thread;
+	struct binder_proc *target_proc;
+
+	spin_lock(&t->lock);
+	target_proc = t->to_proc;
+	target_thread = t->to_thread;
+	/*
+	 * Pin target_thread to keep target_proc alive. Undelivered
+	 * transactions with !target_thread are safe, as target_proc
+	 * can only be the current context there.
+	 */
+	if (target_thread)
+		atomic_inc(&target_thread->tmp_ref);
+	spin_unlock(&t->lock);
 
 	trace_android_vh_free_oem_binder_struct(t);
 	if (target_proc) {
@@ -1922,6 +1954,10 @@ static void binder_free_transaction(struct binder_transaction *t)
 			t->buffer->transaction = NULL;
 		binder_inner_proc_unlock(target_proc);
 	}
+
+	if (target_thread)
+		binder_thread_dec_tmpref(target_thread);
+
 	if (trace_binder_txn_latency_free_enabled())
 		binder_txn_latency_free(t);
 	/*
@@ -3135,6 +3171,22 @@ static int binder_proc_transaction(struct binder_transaction *t,
 	if (thread) {
 		binder_transaction_priority(thread, t, node);
 		binder_enqueue_thread_work_ilocked(thread, &t->work);
+
+		/* Boost for in-app activity transitions (sync txn to main thread of foreground app) */
+		if (thread->task == proc->tsk &&
+			READ_ONCE(proc->tsk->signal->oom_score_adj) == 0 &&
+			kp_active_mode() != 1) {
+			switch (kp_active_mode()) {
+			case 3:
+				qcom_dcvs_bus_boost_kick_max(500);
+				cpu_boost_max(500);
+				break;
+			default:
+				qcom_dcvs_bus_boost_kick(500);
+				cpu_boost_kick(500);
+				break;
+			}
+		}
 	} else if (!pending_async) {
 		trace_android_vh_binder_special_task(t, proc, thread,
 			&t->work, &proc->todo, !oneway, &enqueue_task);
@@ -3418,6 +3470,15 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_invalid_target_handle;
 		}
 		trace_android_vh_binder_trans(target_proc, proc, thread, tr);
+
+		if (!(tr->flags & TF_ONE_WAY) &&
+		    thread->task == proc->tsk &&
+		    READ_ONCE(proc->tsk->signal->oom_score_adj) == 0 &&
+		    kp_active_mode() != 1) {
+			qcom_dcvs_bus_boost_kick(100);
+			cpu_boost_kick(100);
+		}
+
 		if (security_binder_transaction(proc->cred,
 						target_proc->cred) < 0) {
 			binder_txn_error("%d:%d transaction credentials failed\n",
@@ -5930,6 +5991,20 @@ static int binder_ioctl_freeze(struct binder_freeze_info *info,
 	int ret = 0;
 
 	if (!info->enable) {
+		/* Boost for warm app transitions (unfreeze = app coming to foreground) */
+		if (kp_active_mode() != 1) {
+			switch (kp_active_mode()) {
+			case 3:
+				qcom_dcvs_bus_boost_kick_max(1000);
+				cpu_boost_max(1000);
+				break;
+			default:
+				qcom_dcvs_bus_boost_kick(1000);
+				cpu_boost_kick(1000);
+				break;
+			}
+		}
+
 		binder_inner_proc_lock(target_proc);
 		target_proc->sync_recv = false;
 		target_proc->async_recv = false;

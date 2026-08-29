@@ -117,7 +117,7 @@ config ANDROID_VENDOR_OEM_DATA
 
 config ANDROID_SIMPLE_LMK
 	bool "Simple Android Low Memory Killer"
-	depends on !ANDROID_LOW_MEMORY_KILLER && !MEMCG && PSI
+	depends on !ANDROID_LOW_MEMORY_KILLER && !MEMCG && !PSI
 	help
 	  This is a complete low memory killer solution for Android that is
 	  small and simple. Processes are killed according to the priorities
@@ -131,7 +131,7 @@ if ANDROID_SIMPLE_LMK
 config ANDROID_SIMPLE_LMK_MINFREE
 	int "Minimum MiB of memory to free per reclaim"
 	range 8 512
-	default 256
+	default 128
 	help
 	  Simple LMK will try to free at least this much memory per reclaim.
 
@@ -145,25 +145,6 @@ config ANDROID_SIMPLE_LMK_TIMEOUT_MSEC
 	  which can block Simple LMK from killing more processes in time when
 	  needed. After the specified timeout elapses, Simple LMK will stop
 	  waiting and make itself available to kill more processes.
-
-config ANDROID_SIMPLE_LMK_PSI_THRESHOLD_US
-	int "Simple LMK PSI memory SOME threshold (usec)"
-	range 1 10000000
-	default 30000
-	help
-	  Cumulative memory SOME stall threshold, in microseconds, for the
-	  PSI trigger used by Simple LMK.
-	  Example: 100000 means 100ms of cumulative memory SOME stall in
-	  the configured monitoring window.
-
-config ANDROID_SIMPLE_LMK_PSI_WINDOW_US
-	int "Simple LMK PSI monitoring window (usec)"
-	range 250000 10000000
-	default 250000
-	help
-	  Tracking window, in microseconds, for the PSI trigger used by
-	  Simple LMK.
-	  Example: 1000000 means a 1 second monitoring window.
 
 endif
 

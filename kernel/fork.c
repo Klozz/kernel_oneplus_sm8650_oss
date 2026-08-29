@@ -23,6 +23,7 @@
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/cputime.h>
+#include <linux/sched/rt.h>
 #include <linux/seq_file.h>
 #include <linux/rtmutex.h>
 #include <linux/init.h>
@@ -94,7 +95,6 @@
 #include <linux/thread_info.h>
 #include <linux/stackleak.h>
 #include <linux/kasan.h>
-#include <linux/randomize_kstack.h>
 #include <linux/scs.h>
 #include <linux/io_uring.h>
 #include <linux/bpf.h>
@@ -119,6 +119,7 @@
 #undef CREATE_TRACE_POINTS
 #include <trace/hooks/sched.h>
 #include <trace/hooks/mm.h>
+#include <trace/hooks/dtask.h>
 /*
  * Minimum number of threads to boot the kernel
  */
@@ -1114,6 +1115,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	setup_thread_stack(tsk, orig);
 	clear_user_return_notifier(tsk);
 	clear_tsk_need_resched(tsk);
+	clear_tsk_lazy_resched(tsk);
 	set_task_stack_end_magic(tsk);
 	clear_syscall_work_syscall_user_dispatch(tsk);
 
@@ -2177,7 +2179,7 @@ static void __delayed_free_task(struct rcu_head *rhp)
 static __always_inline void delayed_free_task(struct task_struct *tsk)
 {
 	if (IS_ENABLED(CONFIG_MEMCG))
-		call_rcu(&tsk->rcu, __delayed_free_task);
+		call_rcu_hurry(&tsk->rcu, __delayed_free_task);
 	else
 		free_task(tsk);
 }
@@ -2400,7 +2402,10 @@ static __latent_entropy struct task_struct *copy_process(
 	memset(&p->rss_stat, 0, sizeof(p->rss_stat));
 #endif
 
-	p->default_timer_slack_ns = current->timer_slack_ns;
+	if (task_is_realtime(current))
+		p->default_timer_slack_ns = current->default_timer_slack_ns;
+	else
+		p->default_timer_slack_ns = current->timer_slack_ns;
 
 #ifdef CONFIG_PSI
 	p->psi_flags = 0;
@@ -2502,7 +2507,6 @@ static __latent_entropy struct task_struct *copy_process(
 	if (retval)
 		goto bad_fork_cleanup_io;
 
-	random_kstack_task_init(p);
 	stackleak_task_init(p);
 
 	if (pid != &init_struct_pid) {
@@ -2728,6 +2732,7 @@ static __latent_entropy struct task_struct *copy_process(
 	trace_task_newtask(p, clone_flags);
 	uprobe_copy_process(p, clone_flags);
 
+	trace_android_vh_lock_task_fork(p);
 	copy_oom_score_adj(clone_flags, p);
 
 	return p;
@@ -2892,11 +2897,11 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 	/* Boost CPUs to the max for 50 ms when userspace launches an app */
 	if (task_is_zygote(current) && kp_active_mode() != 1) {
 		if (kp_active_mode() == 3) {
-			qcom_dcvs_bus_boost_kick_max(50);
-			cpu_boost_max(50);
+			qcom_dcvs_bus_boost_kick_max(250);
+			cpu_boost_max(250);
 		} else {
-			qcom_dcvs_bus_boost_kick(25);
-			cpu_boost_kick(25);
+			qcom_dcvs_bus_boost_kick(250);
+			cpu_boost_kick(250);
 		}
 	}
 

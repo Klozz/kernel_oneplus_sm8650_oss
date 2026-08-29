@@ -3707,14 +3707,9 @@ extern atomic_long_t num_poisoned_pages __read_mostly;
 extern int soft_offline_page(unsigned long pfn, int flags);
 #ifdef CONFIG_MEMORY_FAILURE
 extern void memory_failure_queue(unsigned long pfn, int flags);
-extern int __get_huge_page_for_hwpoison(unsigned long pfn, int flags);
 #else
 static inline void memory_failure_queue(unsigned long pfn, int flags)
 {
-}
-static inline int __get_huge_page_for_hwpoison(unsigned long pfn, int flags)
-{
-	return 0;
 }
 #endif
 
@@ -3923,5 +3918,8 @@ madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
 	return 0;
 }
 #endif
+
+void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
+							unsigned int alloc_flags);
 
 #endif /* _LINUX_MM_H */

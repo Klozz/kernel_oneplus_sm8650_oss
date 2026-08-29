@@ -14,6 +14,7 @@
 #include <linux/swap.h>
 #include <linux/sched/signal.h>
 #include <linux/sched.h>
+#include <linux/sched_task_critical.h>
 
 #include "deferred-free-helper.h"
 
@@ -24,18 +25,10 @@ static DEFINE_SPINLOCK(free_list_lock);
 struct task_struct *freelist_task;
 EXPORT_SYMBOL_GPL(freelist_task);
 
-#define CRITICAL_OOM_SCORE_ADJ	(-900)
-
 static __always_inline bool task_is_critical(void)
 {
 	/* Kernel threads generally aren't userspace "critical" services. */
-	if (current->flags & PF_KTHREAD)
-		return false;
-
-	if (unlikely(!current->signal))
-		return false;
-
-	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
+	return sched_task_critical(current);
 }
 
 static __always_inline void boost_freelist_priority_for_critical(void)

@@ -1296,6 +1296,7 @@ typedef struct pglist_data {
 	wait_queue_head_t kcompressd_wait;
 	struct task_struct *kcompressd;
 	struct kfifo kcompress_fifo;
+	spinlock_t kcompress_fifo_lock;
 
 	ANDROID_OEM_DATA(1);
 #ifdef CONFIG_COMPACTION

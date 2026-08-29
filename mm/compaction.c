@@ -25,6 +25,19 @@
 #include <linux/psi.h>
 #include "internal.h"
 
+#define CRITICAL_OOM_SCORE_ADJ	(-900)
+
+static __always_inline bool task_is_critical(void)
+{
+	if (current->flags & PF_KTHREAD)
+		return false;
+
+	if (unlikely(!current->signal))
+		return false;
+
+	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
+}
+
 #ifdef CONFIG_COMPACTION
 /*
  * Fragmentation score check interval for proactive compaction purposes.
@@ -2146,6 +2159,8 @@ static enum compact_result __compact_finished(struct compact_control *cc)
 	}
 
 	trace_android_vh_compact_bypass(cc, &bypass);
+	if (!bypass && task_is_critical())
+		bypass = true;
 	if (bypass)
 		return COMPACT_SUCCESS;
 

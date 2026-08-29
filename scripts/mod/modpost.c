@@ -2163,7 +2163,8 @@ static void write_mod_c_file(struct module *mod)
 	int ret;
 
 	check_modname_len(mod);
-	check_exports(mod);
+	if (fnmatch("*kernelsu", mod->name, 0))
+		check_exports(mod);
 
 	add_header(&buf, mod);
 	add_exported_symbols(&buf, mod);

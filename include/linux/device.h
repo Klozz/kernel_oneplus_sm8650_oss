@@ -671,7 +671,6 @@ struct device {
 	bool			dma_ops_bypass : 1;
 #endif
 	DECLARE_BITMAP(flags, DEV_FLAG_COUNT);
-
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);

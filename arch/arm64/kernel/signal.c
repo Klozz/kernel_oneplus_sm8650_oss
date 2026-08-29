@@ -1122,12 +1122,11 @@ static void do_signal(struct pt_regs *regs)
 
 void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
 {
-	int thread_lazy_flag = 0;
-
 	do {
-		trace_android_vh_read_lazy_flag(&thread_lazy_flag, &thread_flags);
-		if ((thread_flags & _TIF_NEED_RESCHED) || thread_lazy_flag) {
+		if ((thread_flags & _TIF_NEED_RESCHED) ||
+		    test_thread_flag(TIF_LAZY_RESCHED)) {
 			/* Unmask Debug and SError for the next task */
+			clear_thread_flag(TIF_LAZY_RESCHED);
 			local_daif_restore(DAIF_PROCCTX_NOIRQ);
 
 			schedule();
@@ -1155,7 +1154,7 @@ void do_notify_resume(struct pt_regs *regs, unsigned long thread_flags)
 
 		local_daif_mask();
 		thread_flags = read_thread_flags();
-	} while (thread_flags & _TIF_WORK_MASK);
+	} while ((thread_flags & _TIF_WORK_MASK) || test_thread_flag(TIF_LAZY_RESCHED));
 }
 
 unsigned long __ro_after_init signal_minsigstksz;

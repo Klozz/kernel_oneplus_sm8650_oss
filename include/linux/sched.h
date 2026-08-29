@@ -925,9 +925,6 @@ struct task_struct {
 	 */
 	unsigned			sched_remote_wakeup:1;
 
-	/* Save user-dumpable when mm goes away */
-	unsigned			user_dumpable:1;
-
 	/* Bit to tell LSMs we're in execve(): */
 	unsigned			in_execve:1;
 	unsigned			in_iowait:1;
@@ -1514,10 +1511,6 @@ struct task_struct {
 	unsigned long			prev_lowest_stack;
 #endif
 
-#ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
-	u32				kstack_offset;
-#endif
-
 #ifdef CONFIG_X86_MCE
 	void __user			*mce_vaddr;
 	__u64				mce_kflags;
@@ -1560,7 +1553,10 @@ struct task_struct {
 
 	ANDROID_KABI_USE(1, unsigned int saved_state);
 	ANDROID_KABI_USE(2, struct task_dma_buf_info *dmabuf_info);
-	ANDROID_KABI_RESERVE(3);
+	ANDROID_KABI_USE(3, struct {
+		/* Save user-dumpable when mm goes away */
+		unsigned	user_dumpable:1;
+		});
 	ANDROID_KABI_RESERVE(4);
 	ANDROID_KABI_RESERVE(5);
 	ANDROID_KABI_RESERVE(6);
@@ -2096,6 +2092,21 @@ static inline void clear_tsk_need_resched(struct task_struct *tsk)
 static inline int test_tsk_need_resched(struct task_struct *tsk)
 {
 	return unlikely(test_tsk_thread_flag(tsk,TIF_NEED_RESCHED));
+}
+
+static inline void set_tsk_lazy_resched(struct task_struct *tsk)
+{
+	set_tsk_thread_flag(tsk, TIF_LAZY_RESCHED);
+}
+
+static inline void clear_tsk_lazy_resched(struct task_struct *tsk)
+{
+	clear_tsk_thread_flag(tsk, TIF_LAZY_RESCHED);
+}
+
+static inline int test_tsk_lazy_resched(struct task_struct *tsk)
+{
+	return unlikely(test_tsk_thread_flag(tsk, TIF_LAZY_RESCHED));
 }
 
 /*

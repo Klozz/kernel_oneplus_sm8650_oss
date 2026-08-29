@@ -6,14 +6,10 @@
 #define pr_fmt(fmt) "simple_lmk: " fmt
 
 #include <linux/freezer.h>
-#include <linux/jiffies.h>
-#include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/mm.h>
 #include <linux/moduleparam.h>
 #include <linux/oom.h>
-#include <linux/psi.h>
-#include <linux/vmpressure.h>
 #include <linux/sched/mm.h>
 #include <linux/sort.h>
 #include <uapi/linux/sched/types.h>
@@ -39,13 +35,10 @@ static struct victim_info victims[MAX_VICTIMS] __cacheline_aligned_in_smp;
 static struct task_struct *task_bucket[SHRT_MAX + 1] __cacheline_aligned;
 static DECLARE_WAIT_QUEUE_HEAD(oom_waitq);
 static DECLARE_WAIT_QUEUE_HEAD(reaper_waitq);
-static unsigned long psi_window_jiffies;
-static unsigned long last_psi_event;
 static DECLARE_COMPLETION(reclaim_done);
 static __cacheline_aligned_in_smp DEFINE_RWLOCK(mm_free_lock);
 static int nr_victims;
 static bool reclaim_active;
-static struct psi_trigger *mem_pressure_trigger;
 static atomic_t needs_reclaim = ATOMIC_INIT(0);
 static atomic_t needs_reap = ATOMIC_INIT(0);
 static atomic_t nr_killed = ATOMIC_INIT(0);
@@ -205,14 +198,6 @@ static void set_task_rt_prio(struct task_struct *tsk, int priority)
 	sched_setscheduler_nocheck(tsk, SCHED_RR, &rt_prio);
 }
 
-static void wake_reclaim_thread(void)
-{
-	atomic_set(&needs_reclaim, 1);
-	smp_mb__after_atomic();
-	if (waitqueue_active(&oom_waitq))
-		wake_up(&oom_waitq);
-}
-
 static void scan_and_kill(void)
 {
 	int i, nr_to_kill, nr_found = 0;
@@ -333,40 +318,6 @@ static void scan_and_kill(void)
 	write_unlock(&mm_free_lock);
 }
 
-static bool psi_recent_enough(void)
-{
-	unsigned long last = READ_ONCE(last_psi_event);
-	unsigned long window = READ_ONCE(psi_window_jiffies);
-
-	return last && window &&
-	       time_before(jiffies, last + window * 2U);
-}
-
-static bool mem_available_too_low(void)
-{
-	long avail = si_mem_available();
-	unsigned long total = totalram_pages();
-
-	if (avail < 0)
-		return false;
-
-	/* 12.5% of total RAM: total / 8 */
-	return avail < (long)(total >> 3);
-}
-
-static int simple_lmk_vmpressure_cb(struct notifier_block *nb,
-				    unsigned long pressure, void *data)
-{
-	if (pressure >= 60 && psi_recent_enough())
-		wake_reclaim_thread();
-	return NOTIFY_OK;
-}
-
-static struct notifier_block vmpressure_notif = {
-	.notifier_call = simple_lmk_vmpressure_cb,
-	.priority = INT_MAX,
-};
-
 static int simple_lmk_reclaim_thread(void *data)
 {
 	/* Use maximum RT priority */
@@ -377,35 +328,6 @@ static int simple_lmk_reclaim_thread(void *data)
 		wait_event_freezable(oom_waitq, atomic_read(&needs_reclaim));
 		scan_and_kill();
 		atomic_set(&needs_reclaim, 0);
-	}
-
-	return 0;
-}
-
-static int simple_lmk_psi_thread(void *data)
-{
-	set_freezable();
-
-	while (!kthread_should_stop()) {
-		unsigned long now;
-
-		wait_event_freezable(mem_pressure_trigger->event_wait,
-				     READ_ONCE(mem_pressure_trigger->event) ||
-				     kthread_should_stop());
-
-		if (kthread_should_stop())
-			break;
-
-		if (cmpxchg(&mem_pressure_trigger->event, 1, 0) != 1)
-			continue;
-
-		now = jiffies;
-
-		WRITE_ONCE(last_psi_event, now);
-
-		/* Fallback for slow-ramp OOM */
-		if (!atomic_read(&needs_reclaim) && mem_available_too_low())
-			wake_reclaim_thread();
 	}
 
 	return 0;
@@ -528,57 +450,25 @@ void simple_lmk_mm_freed(struct mm_struct *mm)
 	read_unlock(&mm_free_lock);
 }
 
+void simple_lmk_reclaim_needed(void)
+{
+	atomic_set(&needs_reclaim, 1);
+	smp_mb__after_atomic();
+	if (waitqueue_active(&oom_waitq))
+		wake_up(&oom_waitq);
+}
+EXPORT_SYMBOL_GPL(simple_lmk_reclaim_needed);
+
 /* Initialize Simple LMK when lmkd in Android writes to the minfree parameter */
 static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
 {
 	static atomic_t init_done = ATOMIC_INIT(0);
 	struct task_struct *thread;
-	char trigger[32];
 
 	if (!atomic_cmpxchg(&init_done, 0, 1)) {
-		psi_window_jiffies = 0;
-
-		if (!IS_ENABLED(CONFIG_PSI)) {
-			pr_err("CONFIG_PSI is required for PSI-based LMK triggering\n");
-			return -EOPNOTSUPP;
-		}
-
-		if (CONFIG_ANDROID_SIMPLE_LMK_PSI_THRESHOLD_US >
-		    CONFIG_ANDROID_SIMPLE_LMK_PSI_WINDOW_US) {
-			pr_err("PSI threshold must be <= PSI window\n");
-			return -EINVAL;
-		}
-
-		scnprintf(trigger, sizeof(trigger), "some %u %u",
-			  CONFIG_ANDROID_SIMPLE_LMK_PSI_THRESHOLD_US,
-			  CONFIG_ANDROID_SIMPLE_LMK_PSI_WINDOW_US);
-
-		psi_window_jiffies =
-			usecs_to_jiffies(CONFIG_ANDROID_SIMPLE_LMK_PSI_WINDOW_US);
-		if (!psi_window_jiffies)
-			psi_window_jiffies = 1;
-
-		mem_pressure_trigger = psi_trigger_create(&psi_system, trigger,
-							  PSI_MEM);
-		if (IS_ERR(mem_pressure_trigger)) {
-			pr_err("Failed to create memory PSI trigger \"%s\": %ld\n",
-			       trigger, PTR_ERR(mem_pressure_trigger));
-			return PTR_ERR(mem_pressure_trigger);
-		}
-
-		pr_info("Using PSI trigger \"%s\" as vmpressure confirmation\n",
-			trigger);
-
-		BUG_ON(vmpressure_notifier_register(&vmpressure_notif));
-
-		thread = kthread_run(simple_lmk_psi_thread, NULL,
-				     "simple_lmkd_psi");
-		BUG_ON(IS_ERR(thread));
-
 		thread = kthread_run(simple_lmk_reaper_thread, NULL,
 				     "simple_lmkd_reaper");
 		BUG_ON(IS_ERR(thread));
-
 		thread = kthread_run(simple_lmk_reclaim_thread, NULL,
 				     "simple_lmkd");
 		BUG_ON(IS_ERR(thread));

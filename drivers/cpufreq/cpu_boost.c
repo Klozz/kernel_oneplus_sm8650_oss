@@ -279,6 +279,13 @@ void cpu_boost_kick(unsigned int duration_ms)
 }
 EXPORT_SYMBOL_GPL(cpu_boost_kick);
 
+bool cpu_boost_active(int cpu)
+{
+	/* Only app-launch MAX boosts disable lazy preemption; kick boosts are transient */
+	return test_bit(cpu, boost_max_active);
+}
+EXPORT_SYMBOL_GPL(cpu_boost_active);
+
 static int boost_policy_notifier(struct notifier_block *nb,
 				 unsigned long val, void *data)
 {

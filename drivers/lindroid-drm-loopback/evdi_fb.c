@@ -92,19 +92,87 @@ static unsigned int evdi_fb_cpp(u32 format)
 	return info->cpp[0];
 }
 
-static struct evdi_gem_object *evdi_fb_acquire_bo(struct drm_file *file,
+static int evdi_fb_calc_size(const struct drm_mode_fb_cmd2 *mode_cmd,
+			     u32 *out_pitch, size_t *out_size)
+{
+	const struct drm_format_info *info = drm_format_info(mode_cmd->pixel_format);
+	u32 pitch, cpp;
+	size_t last_lines, total, tail;
+
+	if (!info || info->num_planes != 1)
+		return -EINVAL;
+
+	cpp = info->cpp[0];
+	if (!cpp)
+		return -EINVAL;
+
+	if (!mode_cmd->width || !mode_cmd->height)
+		return -EINVAL;
+
+	if (check_mul_overflow((u32)mode_cmd->width, cpp, &tail))
+		return -EOVERFLOW;
+
+	if (mode_cmd->pitches[0]) {
+		pitch = mode_cmd->pitches[0];
+		if (pitch < tail)
+			return -EINVAL;
+	} else {
+		pitch = tail;
+	}
+
+	if (check_mul_overflow((size_t)(mode_cmd->height - 1), (size_t)pitch, &last_lines))
+		return -EOVERFLOW;
+
+	if (check_add_overflow((size_t)mode_cmd->offsets[0], last_lines, &total))
+		return -EOVERFLOW;
+
+	if (check_add_overflow(total, tail, &total))
+		return -EOVERFLOW;
+
+	*out_pitch = pitch;
+	*out_size = total;
+	return 0;
+}
+
+static struct evdi_gem_object *evdi_fb_acquire_bo(struct drm_device *dev,
+						  struct drm_file *file,
 						  const struct drm_mode_fb_cmd2 *mode_cmd)
 {
+	size_t size;
+	u32 handle;
+	u32 pitch;
+	int ret;
 	struct drm_gem_object *gem_obj;
+	struct evdi_gem_object *bo;
 
 	if (!mode_cmd || !file)
 		return NULL;
 
 	gem_obj = drm_gem_object_lookup(file, mode_cmd->handles[0]);
-	if (!gem_obj)
+	if (gem_obj)
+		return to_evdi_gem(gem_obj);
+
+	evdi_err("gem lookup failed handle=%u, allocating fallback BO\n",
+		 mode_cmd->handles[0]);
+
+	ret = evdi_fb_calc_size(mode_cmd, &pitch, &size);
+	if (ret) {
+		evdi_err("evdi_fb_calc_size failed: %d\n", ret);
+		return NULL;
+	}
+
+	bo = evdi_gem_alloc_object(dev, size);
+	if (!bo)
 		return NULL;
 
-	return to_evdi_gem(gem_obj);
+	ret = drm_gem_handle_create(file, &bo->base, &handle);
+	if (ret) {
+		evdi_err("drm_gem_handle_create failed: %d\n", ret);
+		drm_gem_object_put(&bo->base);
+		return NULL;
+	}
+
+	return bo;
 }
 
 static int evdi_fb_init_core(struct drm_device *dev,
@@ -115,8 +183,10 @@ static int evdi_fb_init_core(struct drm_device *dev,
 	const struct drm_format_info *info = drm_format_info(mode_cmd->pixel_format);
 	int ret;
 
-	if (!info)
+	if (!info) {
+		evdi_err("evdi_fb_init_core: format_info NULL\n");
 		return -EINVAL;
+	}
 
 	fb->dev = dev;
 	fb->format = info;
@@ -145,9 +215,15 @@ struct drm_framebuffer *evdi_fb_user_fb_create(struct drm_device *dev,
 	struct evdi_gem_object *bo;
 	int ret;
 
-	bo = evdi_fb_acquire_bo(file, mode_cmd);
+	bo = evdi_fb_acquire_bo(dev, file, mode_cmd);
 	if (!bo)
 		return ERR_PTR(-ENOENT);
+
+	if (!bo->gralloc_id) {
+		evdi_err("gralloc_id %d not valid, setting to %u\n",
+			 bo->gralloc_id, mode_cmd->handles[0]);
+		bo->gralloc_id = mode_cmd->handles[0];
+	}
 
 	efb = evdi_fb_alloc(GFP_KERNEL);
 	if (!efb) {
@@ -164,9 +240,11 @@ struct drm_framebuffer *evdi_fb_user_fb_create(struct drm_device *dev,
 
 	ret = evdi_fb_init_core(dev, efb, mode_cmd);
 	if (ret) {
+		evdi_err("evdi_fb_init_core returned %d\n", ret);
 		evdi_gem_object_put_local(&bo->base);
 		kmem_cache_free(evdi_fb_cache, efb);
 		return ERR_PTR(ret);
 	}
+	evdi_debug("evdi_fb_user_fb_create success\n");
 	return &efb->base;
 }

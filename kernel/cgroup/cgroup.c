@@ -3872,7 +3872,7 @@ static ssize_t pressure_write(struct kernfs_open_file *of, char *buf,
 	}
 
 	psi = cgroup_psi(cgrp);
-	new = psi_trigger_create(psi, buf, res);
+	new = psi_trigger_create(psi, buf, res, of->file, of);
 	if (IS_ERR(new)) {
 		cgroup_put(cgrp);
 		return PTR_ERR(new);
@@ -5297,12 +5297,12 @@ static ssize_t __cgroup_procs_write(struct kernfs_open_file *of, char *buf,
 		task_is_zygote(task->parent) && kp_active_mode() != 1) {
 		switch (kp_active_mode()) {
 		case 3:
-			qcom_dcvs_bus_boost_kick_max(500);
-			cpu_boost_max(250);
+			qcom_dcvs_bus_boost_kick_max(3000);
+			cpu_boost_max(2000);
 			break;
 		default:
-			cpu_boost_kick(300);
-			qcom_dcvs_bus_boost_kick(200);
+			qcom_dcvs_bus_boost_kick(3000);
+			cpu_boost_kick(2000);
 			break;
 		}
 	}
