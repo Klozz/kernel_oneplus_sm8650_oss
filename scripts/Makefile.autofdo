@@ -3,6 +3,7 @@
 # Enable available and selected Clang AutoFDO features.
 
 CFLAGS_AUTOFDO_CLANG := -fdebug-info-for-profiling -mllvm -enable-fs-discriminator=true -mllvm -improved-fs-discriminator=true
+CFLAGS_AUTOFDO_CLANG += -mllvm -disable-layout-fsprofile-loader -mllvm -disable-ra-fsprofile-loader
 # for fuzzy profile matching
 CFLAGS_AUTOFDO_CLANG += -mllvm --salvage-stale-profile=true -mllvm --salvage-stale-profile-max-callsites=2000 -mllvm --salvage-unused-profile=true
 
@@ -15,6 +16,7 @@ CFLAGS_AUTOFDO_CLANG += -fprofile-sample-use=$(srctree)/kernel.afdo
 ifdef CONFIG_LTO_CLANG_THIN
   KBUILD_LDFLAGS += --lto-sample-profile=$(srctree)/kernel.afdo
   KBUILD_LDFLAGS += --mllvm=-enable-fs-discriminator=true --mllvm=-improved-fs-discriminator=true -plugin-opt=thinlto
+  KBUILD_LDFLAGS += --mllvm=-disable-layout-fsprofile-loader --mllvm=-disable-ra-fsprofile-loader
   # for fuzzy profile matching
   KBUILD_LDFLAGS += --mllvm=-no-warn-sample-unused=true
 endif

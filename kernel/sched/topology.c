@@ -1560,6 +1560,8 @@ sd_init(struct sched_domain_topology_level *tl,
 			"wrong sd_flags in topology description\n"))
 		sd_flags &= TOPOLOGY_SD_FLAGS;
 
+	unsigned long now_jiffies = jiffies;
+
 	*sd = (struct sched_domain){
 		.min_interval		= sd_weight,
 		.max_interval		= 2*sd_weight,
@@ -1581,7 +1583,7 @@ sd_init(struct sched_domain_topology_level *tl,
 					| sd_flags
 					,
 
-		.last_balance		= jiffies,
+		.last_balance		= now_jiffies,
 		.balance_interval	= sd_weight,
 
 		/* 50% success rate */
@@ -1591,7 +1593,7 @@ sd_init(struct sched_domain_topology_level *tl,
 		.newidle_stamp		= now,
 
 		.max_newidle_lb_cost	= 0,
-		.last_decay_max_lb_cost	= jiffies,
+		.last_decay_max_lb_cost	= now_jiffies,
 		.child			= child,
 #ifdef CONFIG_SCHED_DEBUG
 		.name			= tl->name,
