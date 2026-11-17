@@ -427,7 +427,7 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 	if (need && excess_cached_nats(sbi))
 		f2fs_balance_fs_bg(sbi, false);
 
-	if (!f2fs_is_checkpoint_ready(sbi))
+	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED)))
 		return;
 
 	/*
@@ -436,6 +436,13 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 	 */
 	if (has_enough_free_secs(sbi, 0, 0))
 		return;
+
+	/*
+	 * Submit all cached OPU/IPU DATA bios before triggering
+	 * foreground GC to avoid potential deadlocks.
+	 */
+	f2fs_submit_merged_write(sbi, DATA);
+	f2fs_submit_all_merged_ipu_writes(sbi);
 
 	if (test_opt(sbi, GC_MERGE) && sbi->gc_thread &&
 				sbi->gc_thread->f2fs_gc_task) {
@@ -454,6 +461,7 @@ void f2fs_balance_fs(struct f2fs_sb_info *sbi, bool need)
 			.should_migrate_blocks = false,
 			.err_gc_skipped = false,
 			.nr_free_secs = 1 };
+
 		f2fs_down_write_trace(&sbi->gc_lock, &gc_control.lc);
 		f2fs_gc(sbi, &gc_control);
 	}
@@ -2653,7 +2661,7 @@ static int get_new_segment(struct f2fs_sb_info *sbi,
 	}
 
 	if (pinning) {
-		max_secno = sbi->pinned_area_max_secno;
+		max_secno = min(sbi->pinned_area_max_secno, MAIN_SECS(sbi));
 		hint = 0;
 	}
 
@@ -2860,6 +2868,7 @@ static int change_curseg(struct f2fs_sb_info *sbi, int type)
 	if (IS_ERR(sum_page)) {
 		/* GC won't be able to use stale summary pages by cp_error */
 		memset(curseg->sum_blk, 0, SUM_ENTRY_SIZE);
+		reset_curseg_fields(curseg);
 		return PTR_ERR(sum_page);
 	}
 	sum_node = (struct f2fs_summary_block *)page_address(sum_page);
@@ -3123,6 +3132,7 @@ int f2fs_allocate_new_section(struct f2fs_sb_info *sbi, int type, bool force)
 int f2fs_allocate_pinning_section(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_lock_context lc;
+	unsigned int end_seg;
 	int err;
 	bool gc_required = true;
 
@@ -3132,8 +3142,11 @@ retry:
 	f2fs_unlock_op(sbi, &lc);
 
 	if (has_unpinned_area(sbi) && err == -EAGAIN && gc_required) {
-		err = f2fs_gc_range(sbi, 0,
-				GET_SEG_FROM_SEC(sbi, sbi->pinned_area_max_secno) - 1,
+		end_seg = min(GET_SEG_FROM_SEC(sbi,
+				sbi->pinned_area_max_secno), MAIN_SEGS(sbi));
+		if (!end_seg)
+			return -ENOSPC;
+		err = f2fs_gc_range(sbi, 0, end_seg - 1,
 				true, ZONED_PIN_SEC_REQUIRED_COUNT, true);
 		if (err)
 			return err;

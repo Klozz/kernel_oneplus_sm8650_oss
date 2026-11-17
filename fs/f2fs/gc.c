@@ -1191,7 +1191,7 @@ static int ra_data_block(struct inode *inode, pgoff_t index)
 		.in_list = 0,
 		.retry = 0,
 	};
-	int err;
+	int err = 0;
 
 	f2fs_down_read(&F2FS_I(inode)->i_sem);
 	if (f2fs_is_cow_file(inode)) {
@@ -1257,6 +1257,9 @@ got_it:
 		err = -ENOMEM;
 		goto put_page;
 	}
+
+	if (PageUptodate(fio.encrypted_page))
+		goto put_encrypted_page;
 
 	err = f2fs_submit_page_bio(&fio);
 	if (err)
@@ -1615,6 +1618,16 @@ next_step:
 				continue;
 			}
 
+			if (f2fs_has_inline_data(inode)) {
+				set_sbi_flag(sbi, SBI_NEED_FSCK);
+				f2fs_err(sbi,
+					"inode %lx has both inline_data flag and "
+					"data block, nid=%u, ofs_in_node=%u",
+					inode->i_ino, dni.nid, ofs_in_node);
+				iput(inode);
+				continue;
+			}
+
 			err = f2fs_gc_pinned_control(inode, gc_type, segno);
 			if (err == -EAGAIN) {
 				iput(inode);
@@ -1784,7 +1797,12 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 		if (IS_CURSEC(sbi, GET_SEC_FROM_SEG(sbi, segno))) {
 			f2fs_err(sbi, "%s: segment %u is used by log",
 							__func__, segno);
-			f2fs_bug_on(sbi, 1);
+			/*
+			 * A current section can be reached by the pinned
+			 * fallocate/writeback race; skipping it is safe.
+			 * Flag the fs for fsck instead of panicking.
+			 */
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
 			goto skip;
 		}
 
@@ -2038,6 +2056,8 @@ int f2fs_gc_range(struct f2fs_sb_info *sbi,
 
 	if (unlikely(f2fs_cp_error(sbi)))
 		return -EIO;
+	if (unlikely(start_seg > end_seg))
+		return -EINVAL;
 
 	for (segno = start_seg; segno <= end_seg; segno += sbi->segs_per_sec) {
 		struct gc_inode_list gc_list = {

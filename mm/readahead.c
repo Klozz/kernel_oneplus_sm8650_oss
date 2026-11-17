@@ -333,7 +333,7 @@ static void do_page_cache_ra(struct readahead_control *ractl,
 		for (i = 0; i < nr_to_read; i++) {
 			struct folio *folio = filemap_get_folio(mapping, index + i);
 
-			if (!IS_ERR(folio)) {
+			if (folio) {
 				set_bit(PG_oem_reserved_5, folio_flags(folio, 0));
 				folio_put(folio);
 			}
@@ -503,19 +503,6 @@ static int try_context_readahead(struct address_space *mapping,
 
 	return 1;
 }
-
-/*
- * There are some parts of the kernel which assume that PMD entries
- * are exactly HPAGE_PMD_ORDER.  Those should be fixed, but until then,
- * limit the maximum allocation order to PMD size.  I'm not aware of any
- * assumptions about maximum order if THP are disabled, but 8 seems like
- * a good order (that's 1MB if you're using 4kB pages)
- */
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-#define MAX_PAGECACHE_ORDER	HPAGE_PMD_ORDER
-#else
-#define MAX_PAGECACHE_ORDER	8
-#endif
 
 static inline int ra_alloc_folio(struct readahead_control *ractl, pgoff_t index,
 		pgoff_t mark, unsigned int order, gfp_t gfp)
